@@ -1185,7 +1185,8 @@ waitCtns() {
 	waitFileExist "${workingPath}/run-${ctn}.status"
   done
   # Compatibility with jobScript, read the result of container .status files
-  for filestatus in $(ls ${workingPath}/*.status 2>/dev/null) ; do
+  for filestatus in "${workingPath}"/*.status ; do
+    test -e "${filestatus}" || continue
     exitCode=$(cat "$filestatus")
     test "${highestExitCode}" -lt "${exitCode}" && highestExitCode="${exitCode}"
   done

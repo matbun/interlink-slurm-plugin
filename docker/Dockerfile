@@ -12,9 +12,10 @@ FROM almalinux:9
 # Settings for all images
 ENV TIMEZONE=America/New_York
 
+ARG SLURM_VERSION=25.11.4
+
 # Install system packages (without Slurm -- built from source below)
-RUN DEBIAN_FRONTEND=noninteractive \
-  dnf install -y epel-release \
+RUN dnf install -y epel-release \
   && /usr/bin/crb enable \
   && dnf install -y --allowerasing rpm-build apptainer sshpass slirp4netns iproute curl tar xz make gcc ca-certificates \
   wget bzip2 python3 munge-devel pam-devel readline-devel perl-ExtUtils-MakeMaker \
@@ -22,15 +23,20 @@ RUN DEBIAN_FRONTEND=noninteractive \
   && update-ca-trust \
   && dnf clean all
 
-# Build and install Slurm 25.11 from source (AlmaLinux 9 ships 22.05 which is
+# Build and install Slurm from source (AlmaLinux 9 ships 22.05 which is
 # incompatible with Slinky's slurmctld 25.11 wire protocol)
-RUN wget https://download.schedmd.com/slurm/slurm-25.11.4.tar.bz2 \
-  && rpmbuild -ta --with jwt --with slurmrestd slurm-25.11.4.tar.bz2 \
-  && dnf install -y ~/rpmbuild/RPMS/x86_64/slurm-25.11.4*.rpm \
-  ~/rpmbuild/RPMS/x86_64/slurm-slurmd-25.11.4*.rpm \
-  ~/rpmbuild/RPMS/x86_64/slurm-slurmctld-25.11.4*.rpm \
-  ~/rpmbuild/RPMS/x86_64/slurm-sackd-25.11.4*.rpm \
-  && rm -rf ~/rpmbuild slurm-25.11.4.tar.bz2
+RUN wget https://download.schedmd.com/slurm/slurm-${SLURM_VERSION}.tar.bz2 \
+  && rpmbuild -ta --with jwt --with slurmrestd slurm-${SLURM_VERSION}.tar.bz2 \
+  && dnf install -y ~/rpmbuild/RPMS/x86_64/slurm-${SLURM_VERSION}*.rpm \
+  ~/rpmbuild/RPMS/x86_64/slurm-slurmd-${SLURM_VERSION}*.rpm \
+  ~/rpmbuild/RPMS/x86_64/slurm-slurmctld-${SLURM_VERSION}*.rpm \
+  ~/rpmbuild/RPMS/x86_64/slurm-sackd-${SLURM_VERSION}*.rpm \
+  && rm -rf ~/rpmbuild slurm-${SLURM_VERSION}.tar.bz2 \
+  && dnf remove -y rpm-build \
+  munge-devel pam-devel readline-devel perl-ExtUtils-MakeMaker \
+  mariadb-devel libjwt-devel json-c-devel http-parser-devel \
+  && dnf clean all \
+  && rm -rf /var/cache/dnf
 
 # Ensure slurm user exists (slurm-setuser is not available in 25.11 RPMs)
 RUN id slurm &>/dev/null || useradd -r -s /sbin/nologin slurm
