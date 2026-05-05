@@ -1196,6 +1196,12 @@ func produceSLURMScript(
 		prefix += "\n" + wstunnelClientCommands + "\n"
 	}
 
+	// CERN PATCH (mesh): when mesh.sh is extracted from the pre-exec, we need to
+	// invoke job.sh as mesh.sh's $@ argument (same line) so it inherits the
+	// unshare'd netns mesh.sh creates. Tracked via meshDetected so the default
+	// newline separator below stays in effect for non-mesh jobs (preserves
+	// upstream's SHARED_FS=false base64 heredoc end-marker behaviour).
+	meshDetected := false
 	if preExecAnnotations, ok := metadata.Annotations["slurm-job.vk.io/pre-exec"]; ok {
 		// Check if pre-exec contains a heredoc that creates mesh.sh
 		if strings.Contains(preExecAnnotations, "cat <<'EOFMESH' > $TMPDIR/mesh.sh") {
@@ -1211,6 +1217,7 @@ func produceSLURMScript(
 					// wrote mesh.sh, now add pre-exec without the mesh.sh heredoc
 					preExecWithoutHeredoc := removeHeredoc(preExecAnnotations, "EOFMESH")
 					prefix += "\n" + preExecWithoutHeredoc + "\n" + fmt.Sprintf(" %s", meshPath)
+					meshDetected = true
 				}
 
 				err = os.Chmod(path+"/mesh.sh", 0774)
@@ -1231,6 +1238,15 @@ func produceSLURMScript(
 		}
 	}
 
+	// CERN PATCH (mesh): when mesh.sh is in play, job.sh must be on the SAME
+	// line as mesh.sh so it becomes mesh.sh's "$@" arg → slirp.sh exec's it
+	// inside the unshare'd netns → apptainer inherits the mesh netns. The
+	// non-mesh path keeps upstream's newline behaviour (required for the
+	// SHARED_FS=false base64 heredoc end-marker; see comment below).
+	separator := "\n"
+	if meshDetected {
+		separator = " "
+	}
 	sbatch_macros := "#!" + config.BashPath +
 		"\n#SBATCH --job-name=" + podUID +
 		"\n#SBATCH --output=" + path + "/job.out" +
@@ -1242,7 +1258,7 @@ func produceSLURMScript(
 		// same line ("VKDATA_abc /path/to/job.sh") bash would not recognise
 		// it as the end-of-heredoc, consume the rest of the script into the
 		// heredoc, and never execute job.sh.
-		prefix + "\n" + f.Name() +
+		prefix + separator + f.Name() +
 		"\n"
 
 	log.G(Ctx).Debug("--- Writing SLURM sbatch file")
