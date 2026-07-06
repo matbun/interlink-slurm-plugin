@@ -564,7 +564,9 @@ func TestAssignRanksHeadIsZero(t *testing.T) {
 // produceGangSLURMScript renders the co-scheduled shape with per-rank isolation.
 func TestProduceGangSLURMScriptShape(t *testing.T) {
 	dataRoot := t.TempDir() + string(os.PathSeparator)
-	config := SlurmConfig{BashPath: "/bin/bash"}
+	// A non-empty CommandPrefix mirrors a real deployment (e.g. BSC's
+	// `module load singularity`); the gang script MUST emit it on every rank.
+	config := SlurmConfig{BashPath: "/bin/bash", Commandprefix: "module load singularity"}
 
 	mk := func(uid, role string) *BufferedMember {
 		dir := dataRoot + "default-" + uid
@@ -609,6 +611,35 @@ func TestProduceGangSLURMScriptShape(t *testing.T) {
 	// Per-rank isolation: each member's own dir referenced for -o.
 	if !strings.Contains(s, "default-h/job.out") || !strings.Contains(s, "default-w/job.out") {
 		t.Error("each rank must route -o into its own member dir")
+	}
+
+	// REGRESSION: the site CommandPrefix (e.g. `module load singularity`) MUST run
+	// on every rank, or the container runtime is not on PATH in the srun shell and
+	// job.sh dies with "singularity: command not found" (exit 127). The earlier
+	// shape test never set a CommandPrefix, so it missed this.
+	if got := strings.Count(s, "module load singularity"); got != 2 {
+		t.Errorf("CommandPrefix must run once per rank: got %d occurrences of 'module load singularity', want 2\n---\n%s", got, s)
+	}
+	// REGRESSION: coordination env goes through `srun --export` (so $head_ip is
+	// resolved in the batch shell), NOT re-exported inside the rank's single-quoted
+	// `bash -c`, where $head_ip is empty and would clobber MASTER_ADDR/RAY_ADDRESS.
+	for _, want := range []string{
+		"--export=ALL,RANK=0",
+		"--export=ALL,RANK=1",
+		"MASTER_ADDR=\"$head_ip\"",
+		"RAY_ADDRESS=\"$head_ip:7639\"",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("gang script missing coordination export %q\n---\n%s", want, s)
+		}
+	}
+	if strings.Contains(s, "bash -c 'export RANK=") {
+		t.Error("rank env must not be re-exported inside the single-quoted bash -c (empty $head_ip clobbers MASTER_ADDR/RAY_ADDRESS)")
+	}
+	// The readiness barrier must probe the head coordinator PORT (generic: Ray GCS /
+	// torch rendezvous), not a bare `ray` binary that only exists inside the SIF.
+	if !strings.Contains(s, "/dev/tcp/$head_ip/$MASTER_PORT") {
+		t.Error("readiness barrier must probe the head MASTER_PORT, not a bare `ray` command")
 	}
 }
 

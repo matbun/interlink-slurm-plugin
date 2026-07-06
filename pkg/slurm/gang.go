@@ -268,12 +268,24 @@ func produceGangSLURMScript(
 		out := m.FilesPath + "/job.out"
 		errOut := m.FilesPath + "/job.err"
 		memberScript := m.FilesPath + "/job.sh"
-		inner := fmt.Sprintf(
-			"export RANK=%d WORLD_SIZE=%d MASTER_ADDR=\"$head_ip\" MASTER_PORT=%d RAY_ADDRESS=\"$head_ip:%d\"; exec %s",
-			m.Rank, n, port, port, shellescape.Quote(memberScript),
-		)
+		// Run the site CommandPrefix (e.g. `module load singularity` + compute-node
+		// write) on the compute node so the member's job.sh finds its container
+		// runtime, then exec that job.sh. CommandPrefix runtime vars ($SLURM_JOB_ID,
+		// $WORKDIR) expand in this srun shell. Coordination env is passed via srun
+		// --export below (so $head_ip resolves in the batch shell) rather than
+		// re-exported here from $head_ip, which is NOT in the srun task's environment.
+		inner := "exec " + shellescape.Quote(memberScript)
+		if strings.TrimSpace(config.Commandprefix) != "" {
+			inner = config.Commandprefix + "\n" + inner
+		}
 		body.WriteString("# rank " + strconv.Itoa(m.Rank) + " (" + m.Role + ") pod " + m.PodUID + "\n")
 		body.WriteString("srun --overlap --nodes=1 --ntasks=1 -w \"" + node + "\" \\\n")
+		// Coordination env via srun --export: $head_ip resolves in the batch shell
+		// (double-quoted here), so the value is baked into the srun command line and
+		// reaches the task regardless of the site's default SLURM export policy.
+		body.WriteString("     --export=ALL,RANK=" + strconv.Itoa(m.Rank) + ",WORLD_SIZE=" + strconv.Itoa(n) +
+			",MASTER_ADDR=\"$head_ip\",MASTER_PORT=" + strconv.Itoa(port) +
+			",RAY_ADDRESS=\"$head_ip:" + strconv.Itoa(port) + "\" \\\n")
 		body.WriteString("     -o " + shellescape.Quote(out) + " -e " + shellescape.Quote(errOut) + " --open-mode=truncate \\\n")
 		body.WriteString("  bash -c " + shellescape.Quote(inner) + " &\n")
 		body.WriteString("RANK_PIDS+=($!)\n\n")
@@ -290,9 +302,11 @@ func produceGangSLURMScript(
 		body.WriteString("# readiness barrier: wait for the head coordinator before launching workers\n")
 		body.WriteString("head_ready=0\n")
 		body.WriteString("for i in $(seq 1 60); do\n")
-		body.WriteString("  if srun --overlap --nodes=1 --ntasks=1 -w \"$head_node\" bash -c 'command -v ray >/dev/null 2>&1 && ray status --address \"$RAY_ADDRESS\"' >/dev/null 2>&1; then head_ready=1; break; fi\n")
-		body.WriteString("  # If ray is unavailable, do not block non-Ray gangs.\n")
-		body.WriteString("  if ! srun --overlap --nodes=1 --ntasks=1 -w \"$head_node\" bash -c 'command -v ray >/dev/null 2>&1' >/dev/null 2>&1; then head_ready=1; break; fi\n")
+		body.WriteString("  # Generic readiness: the head (rank 0) opens MASTER_PORT (Ray GCS / torch\n")
+		body.WriteString("  # rendezvous). Probe the port from the head node ($head_ip/$MASTER_PORT\n")
+		body.WriteString("  # expand in the batch shell). The loop proceeds anyway after the timeout so\n")
+		body.WriteString("  # a workload that never opens the port is not blocked forever.\n")
+		body.WriteString("  if srun --overlap --nodes=1 --ntasks=1 -w \"$head_node\" bash -c \"exec 3<>/dev/tcp/$head_ip/$MASTER_PORT\" >/dev/null 2>&1; then head_ready=1; break; fi\n")
 		body.WriteString("  sleep 2\n")
 		body.WriteString("done\n")
 		body.WriteString("echo \"gang head_ready=$head_ready\"\n\n")
