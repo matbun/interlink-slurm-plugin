@@ -3,6 +3,9 @@ package slurm
 import (
 	"fmt"
 	"strings"
+	"time"
+
+	v1 "k8s.io/api/core/v1"
 )
 
 // FlavorConfig holds the configuration for a specific flavor
@@ -84,11 +87,74 @@ type SlurmConfig struct {
 	Flavors                   map[string]FlavorConfig `yaml:"Flavors"`
 	DefaultFlavor             string                  `yaml:"DefaultFlavor"`
 	DefaultUID                *int64                  `yaml:"DefaultUID"` // Optional default User ID for all jobs (RFC: https://github.com/interlink-hq/interlink-slurm-plugin/discussions/58)
+
+	// Gang scheduling. When GangSchedulingEnabled is false (the
+	// default) the plugin behaves exactly as before: 1 Pod = 1 sbatch. When
+	// enabled, pods carrying the `interlink.eu/gang-name` annotation are
+	// BUFFERED in the plugin and submitted together as a single co-scheduled
+	// `sbatch --nodes=N` job. Pods WITHOUT that annotation always take the
+	// unchanged single-pod path, regardless of this flag.
+	GangSchedulingEnabled bool   `yaml:"GangSchedulingEnabled"` // default false
+	// GangTimeout is how long an incomplete gang is buffered before being
+	// abandoned (its buffered members' dirs removed and the entry dropped).
+	// Parsed as a Go duration string (e.g. "10m", "30s"). Empty => 10m.
+	GangTimeout string `yaml:"GangTimeout"`
 }
 
 type CreateStruct struct {
 	PodUID string `json:"PodUID"`
 	PodJID string `json:"PodJID"`
+}
+
+// Gang-scheduling annotation keys. The plugin reads ONLY these
+// interlink.eu/gang-* keys; it never inspects ray.io/* or JobSet labels.
+const (
+	// GangNameAnnotation is the co-allocation key. All pods sharing the same
+	// value are buffered and submitted as ONE `sbatch --nodes=N` job. Its
+	// presence (with GangSchedulingEnabled) is what triggers the gang path.
+	GangNameAnnotation = "interlink.eu/gang-name"
+	// GangSizeAnnotation is the integer N: both the buffering quorum and the
+	// `#SBATCH --nodes=N`. Required on every gang member.
+	GangSizeAnnotation = "interlink.eu/gang-size"
+	// GangRoleAnnotation is "head" or "worker" (default "worker"). role=head is
+	// forced to rank 0.
+	GangRoleAnnotation = "interlink.eu/gang-role"
+	// GangRankAnnotation is an optional explicit rank in 0..N-1. When absent,
+	// ranks are assigned by arrival order (with head pinned to rank 0).
+	GangRankAnnotation = "interlink.eu/gang-rank"
+
+	// GangRoleHead / GangRoleWorker are the two recognised role values.
+	GangRoleHead   = "head"
+	GangRoleWorker = "worker"
+)
+
+// BufferedMember holds everything produceGangSLURMScript needs to render one
+// gang member's own rank line (its already-rendered singularity/enroot runtime
+// command, its per-pod files dir for isolated logs, its role/rank, and the pod
+// itself for command/args). One BufferedMember == one rank on one node.
+type BufferedMember struct {
+	PodUID          string
+	Namespace       string
+	FilesPath       string // per-pod dir (DataRootFolder + ns + "-" + uid): job.sh, JobID.jid, logs
+	Role            string // GangRoleHead or GangRoleWorker
+	Rank            int    // 0..N-1; head is always 0
+	Pod             v1.Pod
+	RuntimeCommands []ContainerCommand // this member's own rendered container commands
+	ResourceLimits  ResourceLimits
+	IsDefaultCPU    bool
+	IsDefaultRam    bool
+	Flavor          *FlavorResolution
+}
+
+// GangEntry is the buffer for a single gang (keyed by gang-name in GangTable).
+// It accumulates members until len(Members) == Size, then submits ONE sbatch.
+type GangEntry struct {
+	Name      string
+	Size      int
+	Members   map[string]*BufferedMember // keyed by PodUID
+	JID       string                     // the shared SLURM job ID once submitted
+	Submitted bool
+	CreatedAt time.Time
 }
 
 type ProbeType string

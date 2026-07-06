@@ -271,6 +271,57 @@ func (h *SidecarHandler) SubmitHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Gang-scheduling branch: when the feature is enabled AND the pod carries the
+	// interlink.eu/gang-name annotation, do NOT submit one sbatch here. Everything
+	// above (mounts/envs/runtime_command_pod + this member's own job.sh via
+	// produceSLURMScript) has already run, so the member is fully rendered. We
+	// buffer it; only the arrival that completes the gang submits ONE
+	// `sbatch --nodes=N` for the whole group and back-fills every member's JID.
+	// A pod WITHOUT the annotation (or with the feature off) skips this block
+	// entirely and takes the unchanged single-pod path below.
+	if isGangPod(h.Config, metadata) {
+		size, err := gangSizeFromMeta(metadata)
+		if err != nil {
+			statusCode = http.StatusInternalServerError
+			h.handleError(spanCtx, w, statusCode, err)
+			os.RemoveAll(filesPath)
+			return
+		}
+		member := gangMemberFromCreate(data.Pod, filesPath, runtime_command_pod, resourceLimits, isDefaultCPU, isDefaultRam, flavor)
+		gangJID, submitted, err := h.bufferGangMember(spanCtx, member, size)
+		if err != nil {
+			span.AddEvent("Failed to submit the gang SLURM Job")
+			statusCode = http.StatusInternalServerError
+			h.handleError(spanCtx, w, http.StatusGatewayTimeout, err)
+			os.RemoveAll(filesPath)
+			return
+		}
+
+		// Respond 200 either way (contract-legal):
+		//   - not yet submitted -> empty PodJID; the VK stamps it unvalidated and
+		//     the pod stays Pending until Status sees this UID's JID appear.
+		//   - submitted -> the shared gang JID for THIS pod; siblings reconcile via
+		//     their own Status re-polls (no VK re-Create needed).
+		if submitted {
+			span.AddEvent("Gang SLURM Job successfully submitted with ID " + gangJID)
+			returnedJID = CreateStruct{PodUID: string(data.Pod.UID), PodJID: gangJID}
+		} else {
+			span.AddEvent("Gang member buffered, awaiting quorum")
+			returnedJID = CreateStruct{PodUID: string(data.Pod.UID), PodJID: ""}
+		}
+
+		returnedJIDBytes, err = json.Marshal(returnedJID)
+		if err != nil {
+			statusCode = http.StatusInternalServerError
+			h.handleError(spanCtx, w, statusCode, err)
+			return
+		}
+		w.WriteHeader(statusCode)
+		commonIL.SetDurationSpan(start, span, commonIL.WithHTTPReturnCode(statusCode))
+		w.Write(returnedJIDBytes)
+		return
+	}
+
 	out, err := SLURMBatchSubmit(h.Ctx, h.Config, path)
 	if err != nil {
 		span.AddEvent("Failed to submit the SLURM Job")

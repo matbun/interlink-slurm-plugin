@@ -190,6 +190,16 @@ func main() {
 		Config: slurmConfig,
 		JIDs:   &JobIDs,
 		Ctx:    ctx,
+		// GangTable buffers pods that share an interlink.eu/gang-name until the gang
+		// is complete (see pkg/slurm/gang.go). Always initialized; only populated
+		// when gang scheduling is enabled and gang-annotated pods arrive.
+		GangTable: make(map[string]*slurm.GangEntry),
+	}
+
+	// Start the background sweeper that abandons timed-out incomplete gangs. Only
+	// meaningful (and only started) when gang scheduling is enabled.
+	if slurmConfig.GangSchedulingEnabled {
+		SidecarAPIs.StartGangSweeper(ctx)
 	}
 
 	mutex := http.NewServeMux()

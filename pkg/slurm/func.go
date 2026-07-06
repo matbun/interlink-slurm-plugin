@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"time"
 
 	"go.opentelemetry.io/otel/trace"
 	"k8s.io/client-go/kubernetes"
@@ -118,6 +119,34 @@ func NewSlurmConfig() (SlurmConfig, error) {
 		// Set default SinfoPath if not configured
 		if SlurmConfigInst.Sinfopath == "" {
 			SlurmConfigInst.Sinfopath = "/usr/bin/sinfo"
+		}
+
+		// Gang scheduling. Off by default; opt in via config or the
+		// GANGSCHEDULINGENABLED env var. GangTimeout defaults to 10m when unset,
+		// and an invalid value is caught early rather than at buffer time.
+		if os.Getenv("GANGSCHEDULINGENABLED") != "" {
+			SlurmConfigInst.GangSchedulingEnabled = os.Getenv("GANGSCHEDULINGENABLED") == "true"
+		}
+		if os.Getenv("GANGTIMEOUT") != "" {
+			SlurmConfigInst.GangTimeout = os.Getenv("GANGTIMEOUT")
+		}
+		if SlurmConfigInst.GangTimeout == "" {
+			SlurmConfigInst.GangTimeout = "10m"
+		}
+		if SlurmConfigInst.GangSchedulingEnabled {
+			// Reject exactly what the runtime (gangGuaranteeTimeout) would refuse to
+			// honour: an unparseable duration OR a non-positive one (e.g. "0s").
+			// Validating and honouring the same predicate keeps config-time and
+			// runtime behaviour consistent rather than silently defaulting a value
+			// the operator explicitly set.
+			d, err := time.ParseDuration(SlurmConfigInst.GangTimeout)
+			if err != nil {
+				return SlurmConfig{}, fmt.Errorf("invalid GangTimeout %q: %w", SlurmConfigInst.GangTimeout, err)
+			}
+			if d <= 0 {
+				return SlurmConfig{}, fmt.Errorf("invalid GangTimeout %q: must be a positive duration", SlurmConfigInst.GangTimeout)
+			}
+			log.G(context.Background()).Infof("Gang scheduling ENABLED (interlink.eu/gang-* annotations; buffer timeout %s)", SlurmConfigInst.GangTimeout)
 		}
 
 		SlurmConfigInst.set = true
