@@ -645,7 +645,7 @@ func TestProduceGangSLURMScriptShape(t *testing.T) {
 		"--export=ALL,RANK=0",
 		"--export=ALL,RANK=1",
 		"MASTER_ADDR=\"$head_ip\"",
-		"RAY_ADDRESS=\"$head_ip:7639\"",
+		"RAY_ADDRESS=\"$head_ip:6379\"",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("gang script missing coordination export %q\n---\n%s", want, s)

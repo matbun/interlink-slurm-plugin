@@ -32,10 +32,14 @@ import (
 )
 
 // gangCoordinationPort is the coordination port exported to every rank as
-// MASTER_PORT / the Ray GCS port. It mirrors PORT=7639 from the validated
-// 03-nodesN-ray.slurm twin. It is fixed for now; a future change can make it
-// per-gang / annotation-driven.
-const gangCoordinationPort = 7639
+// MASTER_PORT / the Ray GCS port. Set to Ray's native GCS port 6379 so KubeRay's
+// injected RAY_PORT/RAY_ADDRESS env (which hardcode 6379) stay CONSISTENT with the
+// port the head actually binds -- otherwise a Ray client that discovers the
+// cluster via the RAY_ADDRESS env var (rather than an explicit --address) would
+// dial the wrong port. torch/MPI don't care about the specific value, so 6379 is
+// safe for all frameworks. Fixed for now; a future change can make it per-gang /
+// annotation-driven.
+const gangCoordinationPort = 6379
 
 // isGangPod reports whether this pod should take the gang path: the feature must
 // be enabled AND the pod must carry a non-empty interlink.eu/gang-name.
