@@ -681,3 +681,42 @@ t.Errorf("normalizeVolumeFileContent(%q) = %q, want %q", tc.input, got, tc.want)
 })
 }
 }
+
+// The plugin must record the job's compute node NATIVELY: the generated
+// job.slurm writes `hostname -f` into the pod dir's compute-node file. This
+// replaces the deployment-side CommandPrefix hack (scontrol StdOut -> dirname ->
+// hostname redirect), which existed only because a static config string cannot
+// know the per-pod dir - the generator can. The shadow/tunnel pod polls this
+// file to learn which node to ssh -L into.
+func TestProduceSLURMScriptWritesComputeNodeNatively(t *testing.T) {
+	ctx := context.Background()
+	workingDir := t.TempDir()
+
+	pod := v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cn-pod",
+			Namespace: "default",
+			UID:       "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+		},
+	}
+	config := SlurmConfig{BashPath: "/bin/bash"}
+
+	if _, err := produceSLURMScript(ctx, config, pod, workingDir, pod.ObjectMeta, nil, ResourceLimits{CPU: 1, Memory: 1024 * 1024}, false, false, nil); err != nil {
+		t.Fatalf("produceSLURMScript() unexpected error: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(workingDir, "job.slurm"))
+	if err != nil {
+		t.Fatalf("read job.slurm: %v", err)
+	}
+	content := string(raw)
+
+	want := "hostname -f > " + workingDir + "/compute-node"
+	if !strings.Contains(content, want) {
+		t.Errorf("job.slurm must natively record the compute node (%q)\n---\n%s", want, content)
+	}
+	// It must run BEFORE the workload (job.sh) so the shadow can resolve the
+	// node while the workload is still starting.
+	if cn, sh := strings.Index(content, want), strings.Index(content, workingDir+"/job.sh"); cn < 0 || sh < 0 || cn > sh {
+		t.Errorf("compute-node write must precede the job.sh invocation (cn@%d job.sh@%d)\n---\n%s", cn, sh, content)
+	}
+}

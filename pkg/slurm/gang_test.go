@@ -565,7 +565,8 @@ func TestAssignRanksHeadIsZero(t *testing.T) {
 func TestProduceGangSLURMScriptShape(t *testing.T) {
 	dataRoot := t.TempDir() + string(os.PathSeparator)
 	// A non-empty CommandPrefix mirrors a real deployment (e.g. BSC's
-	// `module load singularity`); the gang script MUST emit it on every rank.
+	// `module load singularity`); the gang script MUST emit it ONCE at the
+	// batch level (see the regression assertions below).
 	config := SlurmConfig{BashPath: "/bin/bash", Commandprefix: "module load singularity"}
 
 	mk := func(uid, role string) *BufferedMember {
@@ -614,11 +615,28 @@ func TestProduceGangSLURMScriptShape(t *testing.T) {
 	}
 
 	// REGRESSION: the site CommandPrefix (e.g. `module load singularity`) MUST run
-	// on every rank, or the container runtime is not on PATH in the srun shell and
-	// job.sh dies with "singularity: command not found" (exit 127). The earlier
-	// shape test never set a CommandPrefix, so it missed this.
-	if got := strings.Count(s, "module load singularity"); got != 2 {
-		t.Errorf("CommandPrefix must run once per rank: got %d occurrences of 'module load singularity', want 2\n---\n%s", got, s)
+	// ONCE at the BATCH level, not inside each per-rank `srun bash -c`. A per-rank
+	// srun is a fresh sub-shell where the `module` shell-function is often undefined
+	// (interLink submits via a non-login `ssh <host> sbatch`), so a per-rank
+	// `module load singularity` no-ops, `singularity` is off PATH, and job.sh dies
+	// with "singularity: command not found" (exit 127). Emitting it once at the
+	// batch level runs `module load` where `module` is defined; the resulting PATH
+	// then propagates to every rank via `srun --export=ALL`.
+	if got := strings.Count(s, "module load singularity"); got != 1 {
+		t.Errorf("CommandPrefix must run once at the batch level: got %d occurrences of 'module load singularity', want 1\n---\n%s", got, s)
+	}
+	// It must appear BEFORE the first per-rank srun (i.e. at the batch level). If it
+	// came after, it would be inside a rank's bash -c (the 127 regression).
+	if cp, sr := strings.Index(s, "module load singularity"), strings.Index(s, "srun --overlap"); cp < 0 || sr < 0 || cp > sr {
+		t.Errorf("CommandPrefix must be emitted at the batch level (before the first per-rank srun): module@%d srun@%d\n---\n%s", cp, sr, s)
+	}
+	// The per-rank inner must be its own compute-node write followed by
+	// `exec <job.sh>`, with NO CommandPrefix inlined (batch-level only).
+	if !strings.Contains(s, "bash -c 'hostname -f > ") {
+		t.Error("per-rank inner must start with its own compute-node write")
+	}
+	if c := strings.Count(s, "exec "); c < 2 {
+		t.Errorf("each rank inner must exec its member job.sh (got %d exec occurrences)", c)
 	}
 	// REGRESSION: coordination env goes through `srun --export` (so $head_ip is
 	// resolved in the batch shell), NOT re-exported inside the rank's single-quoted
@@ -735,4 +753,296 @@ func simulateDeleteConcurrent(h *SidecarHandler, uid, dir string) error {
 	}
 	span := trace.SpanFromContext(h.Ctx)
 	return removeJobFilesWithRetry(h.Ctx, span, uid, jid, dir)
+}
+
+// --- stale submitted-gang regression tests -----------------------------------
+//
+// Field failure this guards against (BSC, job 42973171): a KubeRay RayCluster
+// gang submitted as one sbatch, the job FAILED and aged out of the SLURM
+// controller (squeue -j -> "Invalid job id specified"), then the user deleted
+// and recreated the RayCluster. The new pods carried the SAME gang-name but NEW
+// UIDs; bufferGangMember found the old GangEntry still Submitted and handed the
+// DEAD JID to every new pod, pinning them Pending forever. A submitted entry
+// whose JID is gone from SLURM must be dropped so the new generation gets a
+// fresh sbatch.
+
+// slurmJobGone classifies squeue output; table locks the liveness contract.
+func TestSlurmJobGoneClassifier(t *testing.T) {
+	// rc matters: go-execute v1 returns err=nil for ANY nonzero exit (the error
+	// lives only in ExecResult.ExitCode), so a signal-killed ssh shim (exit
+	// 143/255, empty stdout AND stderr) must NOT be classified gone - that
+	// would drop a live gang and double-submit (found by adversarial review,
+	// reproduced against go-execute v0.6.0).
+	cases := []struct {
+		name   string
+		stdout string
+		stderr string
+		rc     int
+		gone   bool
+	}{
+		{"invalid job id (aged out of controller)", "", "slurm_load_jobs error: Invalid job id specified\n", 1, true},
+		{"running", "R\n", "", 0, false},
+		{"pending", "PD\n", "", 0, false},
+		{"completing", "CG\n", "", 0, false},
+		{"configuring", "CF\n", "", 0, false},
+		{"suspended", "S\n", "", 0, false},
+		{"failed", "F\n", "", 0, true},
+		{"completed", "CD\n", "", 0, true},
+		{"cancelled", "CA\n", "", 0, true},
+		{"timeout", "TO\n", "", 0, true},
+		{"node fail", "NF\n", "", 0, true},
+		{"out of memory", "OOM\n", "", 0, true},
+		{"empty output with CLEAN exit means unknown job", "", "", 0, true},
+		{"signal-killed ssh (rc 143, silent) is NOT gone", "", "", 143, false},
+		{"ssh remote death (rc 255, silent) is NOT gone", "", "", 255, false},
+		{"nonzero exit distrusts stdout too (partial pipe output)", "F\n", "", 137, false},
+		{"transient ssh shim failure is NOT gone", "", "ssh: connect to host alogin1.bsc.es port 22: Connection refused\n", 255, false},
+		{"unrecognized state treated alive (never double-submit)", "XX\n", "", 0, false},
+		{"padded squeue -O output", "R               \n", "", 0, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := slurmJobGone(c.stdout, c.stderr, c.rc); got != c.gone {
+				t.Errorf("slurmJobGone(%q, %q, %d) = %v, want %v", c.stdout, c.stderr, c.rc, got, c.gone)
+			}
+		})
+	}
+}
+
+// THE regression test: new-UID members of a same-named gang whose submitted job
+// is dead must start a FRESH generation (fresh sbatch), not inherit the dead JID.
+func TestStaleSubmittedGangStartsFreshGeneration(t *testing.T) {
+	h, dataRoot, scancelCount := newHandlerWithStubs(t, "111")
+	bin := filepath.Dir(h.Config.Sbatchpath)
+
+	// Generation 1 submits as job 111.
+	if _, submitted, err := bufferPod(t, h, newGangPod("a1", "g1", GangRoleHead, 2, nil), 2); err != nil || submitted {
+		t.Fatalf("gen1 head buffer: submitted=%v err=%v", submitted, err)
+	}
+	if jid, submitted, err := bufferPod(t, h, newGangPod("b1", "g1", GangRoleWorker, 2, nil), 2); err != nil || !submitted || jid != "111" {
+		t.Fatalf("gen1 quorum: jid=%q submitted=%v err=%v", jid, submitted, err)
+	}
+
+	// Job 111 dies and ages out: squeue rejects the job id (verbatim BSC output).
+	h.Config.Squeuepath = writeStubScript(t, bin, "squeue",
+		`echo "slurm_load_jobs error: Invalid job id specified" >&2; exit 1`)
+	// Any fresh submission must be observable: counting sbatch, new JID 222.
+	sbatchCalls := filepath.Join(bin, "sbatch.count")
+	h.Config.Sbatchpath = writeStubScript(t, bin, "sbatch",
+		"echo x >> "+sbatchCalls+"\necho \"Submitted batch job 222\"")
+
+	// Generation 2: same gang-name, NEW pod UIDs (operator deleted + recreated).
+	jid, submitted, err := bufferPod(t, h, newGangPod("a2", "g1", GangRoleHead, 2, nil), 2)
+	if err != nil {
+		t.Fatalf("gen2 first member errored: %v", err)
+	}
+	if submitted || jid != "" {
+		t.Fatalf("gen2 first member must be BUFFERED for a fresh generation, not bound to the dead JID: jid=%q submitted=%v", jid, submitted)
+	}
+	if e := h.GangTable["g1"]; e == nil || e.Submitted || len(e.Members) != 1 {
+		t.Fatalf("stale entry not replaced by a fresh 1-member buffer: %+v", h.GangTable["g1"])
+	}
+
+	jid2, submitted2, err := bufferPod(t, h, newGangPod("b2", "g1", GangRoleWorker, 2, nil), 2)
+	if err != nil {
+		t.Fatalf("gen2 quorum errored: %v", err)
+	}
+	if !submitted2 || jid2 != "222" {
+		t.Fatalf("gen2 quorum must submit FRESH sbatch: jid=%q submitted=%v (want 222,true)", jid2, submitted2)
+	}
+	for _, uid := range []string{"a2", "b2"} {
+		e, ok := (*h.JIDs)[uid]
+		if !ok || e.JID != "222" {
+			t.Errorf("gen2 member %s JID = %v, want 222", uid, e)
+		}
+		b, err := os.ReadFile(memberDir(dataRoot, uid) + "/JobID.jid")
+		if err != nil || string(b) != "222" {
+			t.Errorf("gen2 member %s JobID.jid on disk = %q err=%v, want 222", uid, string(b), err)
+		}
+	}
+	if b, err := os.ReadFile(sbatchCalls); err != nil || len(strings.Split(strings.TrimSpace(string(b)), "\n")) != 1 {
+		t.Errorf("expected exactly one fresh sbatch for gen2, got %q err=%v", string(b), err)
+	}
+	if scancelCalls(t, scancelCount) != 0 {
+		t.Error("dropping a stale (already dead) gang entry must NOT scancel")
+	}
+}
+
+// A NEW pod UID arriving while the submitted gang's job is still ALIVE is a
+// replacement pod (e.g. the operator recreated one member): bind it to the live
+// shared JID, do not resubmit.
+func TestNewUIDBindsToLiveSubmittedGang(t *testing.T) {
+	h, _, _ := newHandlerWithStubs(t, "111")
+	bin := filepath.Dir(h.Config.Sbatchpath)
+
+	if _, _, err := bufferPod(t, h, newGangPod("h", "g1", GangRoleHead, 2, nil), 2); err != nil {
+		t.Fatalf("head buffer: %v", err)
+	}
+	if _, submitted, err := bufferPod(t, h, newGangPod("w", "g1", GangRoleWorker, 2, nil), 2); err != nil || !submitted {
+		t.Fatalf("quorum: submitted=%v err=%v", submitted, err)
+	}
+
+	// The job is alive; any further sbatch would be a bug.
+	h.Config.Squeuepath = writeStubScript(t, bin, "squeue", `echo "R"`)
+	sbatchCalls := filepath.Join(bin, "sbatch.count")
+	h.Config.Sbatchpath = writeStubScript(t, bin, "sbatch",
+		"echo x >> "+sbatchCalls+"\necho \"Submitted batch job 333\"")
+
+	jid, submitted, err := bufferPod(t, h, newGangPod("r", "g1", GangRoleWorker, 2, nil), 2)
+	if err != nil {
+		t.Fatalf("replacement member errored: %v", err)
+	}
+	if !submitted || jid != "111" {
+		t.Errorf("replacement pod must bind to the LIVE shared JID: jid=%q submitted=%v (want 111,true)", jid, submitted)
+	}
+	if e, ok := (*h.JIDs)["r"]; !ok || e.JID != "111" {
+		t.Errorf("replacement pod not registered on shared JID: %v", e)
+	}
+	if _, err := os.Stat(sbatchCalls); !os.IsNotExist(err) {
+		t.Error("no sbatch may be issued while the gang job is alive")
+	}
+}
+
+// A re-Create of a UID that WAS part of the submitted gang stays idempotent and
+// returns the shared JID WITHOUT consulting squeue: even if the job is gone, the
+// pod belongs to the old generation and must keep its JID (Status handles the
+// terminal reporting). Only never-seen UIDs may trigger the staleness probe.
+func TestSubmittedGangSameUIDIdempotentEvenIfJobGone(t *testing.T) {
+	h, _, _ := newHandlerWithStubs(t, "111")
+	bin := filepath.Dir(h.Config.Sbatchpath)
+
+	head := newGangPod("h", "g1", GangRoleHead, 2, nil)
+	if _, _, err := bufferPod(t, h, head, 2); err != nil {
+		t.Fatalf("head buffer: %v", err)
+	}
+	if _, submitted, err := bufferPod(t, h, newGangPod("w", "g1", GangRoleWorker, 2, nil), 2); err != nil || !submitted {
+		t.Fatalf("quorum: submitted=%v err=%v", submitted, err)
+	}
+
+	// squeue would report the job gone - must be irrelevant for a KNOWN member.
+	h.Config.Squeuepath = writeStubScript(t, bin, "squeue",
+		`echo "slurm_load_jobs error: Invalid job id specified" >&2; exit 1`)
+
+	jid, submitted, err := bufferPod(t, h, head, 2)
+	if err != nil {
+		t.Fatalf("same-UID re-Create errored: %v", err)
+	}
+	if !submitted || jid != "111" {
+		t.Errorf("same-UID re-Create must return the shared JID: jid=%q submitted=%v (want 111,true)", jid, submitted)
+	}
+	if e := h.GangTable["g1"]; e == nil || !e.Submitted || len(e.Members) != 2 {
+		t.Errorf("submitted entry must be untouched by a same-UID re-Create: %+v", h.GangTable["g1"])
+	}
+}
+
+// Native per-rank compute-node discovery: EACH rank records ITS OWN node into
+// ITS OWN member dir (inside the rank's srun, so `hostname -f` runs on the
+// rank's node, not the batch node). This is what a worker's exposed-ports
+// shadow tunnel needs - in a --nodes=N gang the worker runs on a DIFFERENT
+// node than the head. Replaces the CommandPrefix scontrol-StdOut hack, which
+// resolved the job-level output dir (the head dir) for every rank and raced.
+func TestGangScriptWritesPerRankComputeNode(t *testing.T) {
+	dataRoot := t.TempDir() + string(os.PathSeparator)
+	config := SlurmConfig{BashPath: "/bin/bash", Commandprefix: "module load singularity"}
+
+	mk := func(uid, role string) *BufferedMember {
+		dir := dataRoot + "default-" + uid
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		return gangMemberFromCreate(newGangPod(uid, "g1", role, 2, nil), dir, nil, ResourceLimits{}, true, true, nil)
+	}
+	entry := &GangEntry{Name: "g1", Size: 2, Members: map[string]*BufferedMember{
+		"h": mk("h", GangRoleHead),
+		"w": mk("w", GangRoleWorker),
+	}}
+	ordered := assignRanks(entry.Members)
+
+	path, err := produceGangSLURMScript(context.Background(), config, entry, ordered)
+	if err != nil {
+		t.Fatalf("produceGangSLURMScript: %v", err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read gang script: %v", err)
+	}
+	s := string(b)
+
+	// Quoting note: the rank inner goes through nested shellescape (the path is
+	// quoted inside the inner, the inner is quoted into bash -c), so assert the
+	// SEMANTIC parts - the member-specific target path and the hostname write -
+	// rather than exact quote bytes.
+	firstSrun := strings.Index(s, "srun --overlap")
+	if firstSrun < 0 {
+		t.Fatalf("gang script has no per-rank srun\n---\n%s", s)
+	}
+	for _, uid := range []string{"h", "w"} {
+		want := "default-" + uid + "/compute-node"
+		idx := strings.Index(s, want)
+		if idx < 0 {
+			t.Errorf("gang script must write rank compute-node into member %s's OWN dir (%q)\n---\n%s", uid, want, s)
+			continue
+		}
+		// The write must be INSIDE the rank's srun bash -c (i.e. AFTER the first
+		// srun of the script), not at the batch level: at batch level `hostname`
+		// reports the batch host (nodes[0]) for every member, which is wrong for
+		// workers.
+		if idx < firstSrun {
+			t.Errorf("member %s compute-node write must run inside its rank srun, not at batch level\n---\n%s", uid, s)
+		}
+	}
+	if got := strings.Count(s[firstSrun:], "hostname -f > "); got != 2 {
+		t.Errorf("expected one per-rank hostname write per member (2), got %d\n---\n%s", got, s)
+	}
+}
+
+// Deterministic head discovery for shadow/tunnel pods: the gang batch script
+// (which runs on nodes[0] = the head's node) must publish the head node under
+// a well-known gang-keyed path <DataRootFolder>/.gang-heads/<ns>-<gangname>.
+// The VK's wstunnel template exposes only name/namespace/labels/annotations
+// (NO pod UID, verified against interLink 0.6.1), so a shadow pod cannot
+// resolve the head member's per-UID dir - but it CAN read its own
+// interlink.eu/gang-name annotation and fetch this file. Replaces the
+// newest-compute-node-file race for gang heads.
+func TestGangScriptPublishesGangHeadDiscoveryFile(t *testing.T) {
+	dataRoot := t.TempDir() + string(os.PathSeparator)
+	config := SlurmConfig{BashPath: "/bin/bash", DataRootFolder: dataRoot, Commandprefix: "module load singularity"}
+
+	mk := func(uid, role string) *BufferedMember {
+		dir := dataRoot + "default-" + uid
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		return gangMemberFromCreate(newGangPod(uid, "g1", role, 2, nil), dir, nil, ResourceLimits{}, true, true, nil)
+	}
+	entry := &GangEntry{Name: "g1", Size: 2, Members: map[string]*BufferedMember{
+		"h": mk("h", GangRoleHead),
+		"w": mk("w", GangRoleWorker),
+	}}
+	ordered := assignRanks(entry.Members)
+
+	path, err := produceGangSLURMScript(context.Background(), config, entry, ordered)
+	if err != nil {
+		t.Fatalf("produceGangSLURMScript: %v", err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read gang script: %v", err)
+	}
+	s := string(b)
+
+	headFile := dataRoot + ".gang-heads/default-g1"
+	idx := strings.Index(s, headFile)
+	if idx < 0 {
+		t.Fatalf("gang script must publish the head node to %q\n---\n%s", headFile, s)
+	}
+	// Must run at the BATCH level (before any srun): the batch script executes on
+	// nodes[0], which is rank 0's (the head's) node, so `hostname -f` there IS the
+	// head node. Inside a rank srun it could be any member's node.
+	if firstSrun := strings.Index(s, "srun --overlap"); firstSrun >= 0 && idx > firstSrun {
+		t.Errorf("gang-head discovery write must be at the batch level, before the per-rank sruns\n---\n%s", s)
+	}
+	if !strings.Contains(s, "mkdir -p ") {
+		t.Error("the .gang-heads dir must be created before writing into it")
+	}
 }

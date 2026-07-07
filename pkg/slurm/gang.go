@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	exec "github.com/alexellis/go-execute/pkg/v1"
 	"github.com/containerd/containerd/log"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -242,6 +243,37 @@ func produceGangSLURMScript(
 	body.WriteString("# interLink gang-scheduling job (interlink.eu/gang-name=" + entry.Name + ")\n")
 	body.WriteString("# One sbatch --nodes=" + strconv.Itoa(n) + " co-allocates the whole gang; each rank runs on one node.\n\n")
 
+	// Site setup (e.g. `module load singularity`) at the BATCH level, mirroring the
+	// single-pod path in produceSLURMScript. The single-pod script runs the
+	// CommandPrefix in the batch shell, so its PATH changes are visible to job.sh.
+	// The gang used to run the CommandPrefix inside each per-rank `srun bash -c`, a
+	// FRESH sub-shell where the `module` shell-function is often NOT defined (the
+	// interLink sbatch is submitted via a non-login `ssh <host> sbatch`), so
+	// `module load singularity` silently no-oped, `singularity` was off PATH, and
+	// job.sh's bare `singularity` exited 127. Running it ONCE here executes
+	// `module load` in the batch shell (where `module` IS defined) and the resulting
+	// PATH propagates to every rank via `srun --export=ALL`. It also writes the
+	// compute-node file exactly once (from the head/batch node) instead of the old
+	// racing per-rank writes.
+	if strings.TrimSpace(config.Commandprefix) != "" {
+		body.WriteString("# --- site CommandPrefix (batch level; PATH propagates to ranks via --export=ALL) ---\n")
+		body.WriteString(config.Commandprefix + "\n\n")
+	}
+
+	// Deterministic head-node discovery for the shadow/tunnel pods. The batch
+	// script executes on nodes[0], which IS rank 0's (the head's) node, so
+	// `hostname -f` here is the head node. Publish it under a well-known,
+	// gang-keyed path: the VK's wstunnel template exposes only name / namespace /
+	// labels / annotations (NO pod UID, verified against interLink 0.6.1), so a
+	// shadow pod cannot resolve the head member's per-UID dir - but it CAN read
+	// its own interlink.eu/gang-name annotation and fetch this file. A recreated
+	// gang generation simply overwrites the file (latest wins). Best-effort:
+	// discovery must never kill the workload.
+	headDiscovery := config.DataRootFolder + gangHeadsDirName + "/" + head.Namespace + "-" + entry.Name
+	body.WriteString("# --- publish head node for shadow/tunnel discovery (batch node == head node) ---\n")
+	body.WriteString("mkdir -p " + shellescape.Quote(config.DataRootFolder+gangHeadsDirName) +
+		" && hostname -f > " + shellescape.Quote(headDiscovery) + " || true\n\n")
+
 	port := gangCoordinationPort
 
 	// Resolve the allocation's nodes and the head IP (copied from the twin).
@@ -268,16 +300,22 @@ func produceGangSLURMScript(
 		out := m.FilesPath + "/job.out"
 		errOut := m.FilesPath + "/job.err"
 		memberScript := m.FilesPath + "/job.sh"
-		// Run the site CommandPrefix (e.g. `module load singularity` + compute-node
-		// write) on the compute node so the member's job.sh finds its container
-		// runtime, then exec that job.sh. CommandPrefix runtime vars ($SLURM_JOB_ID,
-		// $WORKDIR) expand in this srun shell. Coordination env is passed via srun
-		// --export below (so $head_ip resolves in the batch shell) rather than
-		// re-exported here from $head_ip, which is NOT in the srun task's environment.
-		inner := "exec " + shellescape.Quote(memberScript)
-		if strings.TrimSpace(config.Commandprefix) != "" {
-			inner = config.Commandprefix + "\n" + inner
-		}
+		// Record THIS rank's compute node into THIS member's own dir, then exec the
+		// member's job.sh. The write runs inside the rank's srun (hostname -f on the
+		// rank's node - in a --nodes=N gang the worker is on a DIFFERENT node than
+		// the head), giving true per-member node discovery for the shadow/tunnel
+		// pods. Best-effort (|| true): a failed write must not kill the rank.
+		//
+		// The site CommandPrefix (module loads etc.) is emitted ONCE at the batch
+		// level above; its PATH changes reach this rank via `srun --export=ALL`, so
+		// the member's job.sh finds its container runtime. We deliberately do NOT
+		// re-run the CommandPrefix here: a per-rank `srun bash -c` is a fresh
+		// sub-shell where the `module` shell-function is often undefined, so
+		// `module load singularity` would no-op and job.sh's bare `singularity`
+		// would exit 127 (the original bug). Coordination env is passed via srun
+		// --export below (so $head_ip resolves in the batch shell).
+		inner := "hostname -f > " + shellescape.Quote(m.FilesPath+"/compute-node") + " || true\n" +
+			"exec " + shellescape.Quote(memberScript)
 		body.WriteString("# rank " + strconv.Itoa(m.Rank) + " (" + m.Role + ") pod " + m.PodUID + "\n")
 		body.WriteString("srun --overlap --nodes=1 --ntasks=1 -w \"" + node + "\" \\\n")
 		// Coordination env via srun --export: $head_ip resolves in the batch shell
@@ -340,6 +378,69 @@ func produceGangSLURMScript(
 	log.G(Ctx).Infof("Rendered gang sbatch for '%s' (%d nodes) at %s", entry.Name, n, scriptPath)
 	return scriptPath, nil
 }
+
+// slurmJobGone classifies one squeue probe of a submitted gang's JID and
+// reports whether the job is DEFINITIVELY gone from SLURM. The decision is
+// deliberately asymmetric: resubmitting over a live job is the worse failure
+// mode (two allocations writing the same member dirs), so anything ambiguous
+// reports NOT gone.
+//   - stderr "Invalid job id" -> gone: the controller no longer knows the job
+//     (it ran and aged out, exactly what a dead gang looks like after MinJobAge).
+//   - any OTHER stderr (e.g. a transient SSH failure through the site's squeue
+//     shim) -> NOT gone: indeterminate, never risk a double submit.
+//   - clean run, empty output -> gone (with --states=all a live job always prints).
+//   - terminal StateCompact code -> gone; live or unrecognized codes -> NOT gone.
+func slurmJobGone(stdout, stderr string, exitCode int) bool {
+	errS := strings.TrimSpace(stderr)
+	if errS != "" {
+		// rc-independent: squeue exits 1 alongside this message.
+		return strings.Contains(errS, "Invalid job id")
+	}
+	// go-execute v1 returns err=nil for ANY nonzero exit (the failure lives only
+	// in ExitCode), so a signal-killed ssh shim surfaces here as nonzero rc with
+	// EMPTY stdout and stderr - maximally ambiguous. Without this gate the empty-
+	// output branch below would declare a live gang gone and double-submit
+	// (found by adversarial review, reproduced against go-execute v0.6.0). On a
+	// nonzero exit, distrust stdout too (could be partial pipe output): only the
+	// explicit Invalid-job-id marker above may declare gone.
+	if exitCode != 0 {
+		return false
+	}
+	out := strings.TrimSpace(stdout)
+	if out == "" {
+		return true
+	}
+	switch strings.Fields(out)[0] {
+	// Unambiguously terminal squeue StateCompact codes. PR (preempted) is
+	// deliberately absent: a preempt-requeued job returns to PD.
+	case "CD", "CA", "F", "TO", "NF", "BF", "DL", "OOM", "SE":
+		return true
+	}
+	return false
+}
+
+// gangJobIsGone asks SLURM whether the submitted gang JID still exists, using
+// the same squeue invocation shape as Status.go. A failure to even run squeue
+// reports NOT gone (see slurmJobGone's asymmetry rationale).
+func gangJobIsGone(Ctx context.Context, config SlurmConfig, jid string) bool {
+	shell := exec.ExecTask{
+		Command: config.Squeuepath,
+		Args:    []string{"--noheader", "-a", "--states=all", "-O", "StateCompact", "-j ", jid},
+		Shell:   true,
+	}
+	execReturn, err := shell.Execute()
+	if err != nil {
+		log.G(Ctx).Warning("Gang staleness probe: could not run squeue for JID "+jid+": ", err, " (treating as alive)")
+		return false
+	}
+	return slurmJobGone(execReturn.Stdout, execReturn.Stderr, execReturn.ExitCode)
+}
+
+// gangHeadsDirName is the well-known directory (under DataRootFolder) where a
+// gang's batch script publishes the head node's hostname, keyed
+// <namespace>-<gangname>. Shadow/tunnel pods resolve the head through it (they
+// know their gang-name annotation but not any pod UID).
+const gangHeadsDirName = ".gang-heads"
 
 // gangMarkerFile is the per-member marker file that flags a pod dir as belonging
 // to a co-scheduled gang. Its presence (checked by LoadJIDs and Status) is what
@@ -439,13 +540,49 @@ func (h *SidecarHandler) bufferGangMember(Ctx context.Context, member *BufferedM
 	// Idempotency / re-Create safety: if this UID is already buffered, or the gang
 	// is already submitted, do not double-count.
 	if entry.Submitted {
-		// The gang already went out. Register this UID against the shared JID (in
-		// case a re-Create arrives for an already-submitted gang) and report it.
-		if err := stampJID(Ctx, h.JIDs, member.PodUID, member.Namespace, entry.JID, member.FilesPath); err != nil {
-			return "", false, err
+		// A re-Create of a UID that WAS part of the submitted gang: idempotently
+		// re-stamp and report the shared JID. No squeue probe here - the pod
+		// belongs to THIS generation whatever state its job is in (Status.go owns
+		// the terminal reporting).
+		if _, known := entry.Members[member.PodUID]; known {
+			if err := stampJID(Ctx, h.JIDs, member.PodUID, member.Namespace, entry.JID, member.FilesPath); err != nil {
+				return "", false, err
+			}
+			log.G(Ctx).Infof("Gang '%s': already submitted, returning shared JID %s for re-Created member %s", gangName, entry.JID, member.PodUID)
+			return entry.JID, true, nil
 		}
-		log.G(Ctx).Infof("Gang '%s': already submitted, returning shared JID %s for pod %s", gangName, entry.JID, member.PodUID)
-		return entry.JID, true, nil
+
+		// A pod UID we have NEVER seen arrives for an already-submitted gang. Two
+		// legitimate causes, distinguished by asking SLURM about the entry's JID:
+		//   - the job is still ALIVE -> this is a replacement pod (the operator
+		//     recreated one member while the allocation lives on); bind it to the
+		//     live shared JID, never resubmit over a running gang;
+		//   - the job is GONE (ran and aged out of the controller - the squeue
+		//     probe echoes "Invalid job id") -> the whole workload was deleted and
+		//     recreated under the same gang-name; the entry is STALE. Handing out
+		//     the dead JID would pin every new pod Pending forever (field failure:
+		//     BSC job 42973171). Drop the entry and buffer this member as the
+		//     first of a FRESH generation.
+		// The probe costs one squeue round-trip under GangMu, only on this rare
+		// path (never on first-generation Creates), which also serializes
+		// concurrent new-generation arrivals so exactly one of them rebuilds the
+		// entry.
+		if !gangJobIsGone(Ctx, h.Config, entry.JID) {
+			entry.Members[member.PodUID] = member
+			if err := stampJID(Ctx, h.JIDs, member.PodUID, member.Namespace, entry.JID, member.FilesPath); err != nil {
+				return "", false, err
+			}
+			log.G(Ctx).Warningf("Gang '%s': new pod %s joined an already-submitted LIVE gang (JID %s); binding as replacement", gangName, member.PodUID, entry.JID)
+			return entry.JID, true, nil
+		}
+		log.G(Ctx).Warningf("Gang '%s': submitted JID %s is gone from SLURM; dropping the stale entry and starting a fresh generation with pod %s", gangName, entry.JID, member.PodUID)
+		entry = &GangEntry{
+			Name:      gangName,
+			Size:      size,
+			Members:   make(map[string]*BufferedMember),
+			CreatedAt: time.Now(),
+		}
+		h.GangTable[gangName] = entry
 	}
 	entry.Members[member.PodUID] = member
 

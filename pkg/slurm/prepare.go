@@ -1300,6 +1300,13 @@ func produceSLURMScript(
 		}
 	}
 
+	// Record which compute node the job landed on: the shadow/tunnel
+	// pod polls <pod-dir>/compute-node to learn where to ssh -L. The generator
+	// knows the per-pod dir, so no scontrol/StdOut reverse-engineering (the old
+	// deployment-side CommandPrefix hack) is needed. Best-effort (|| true): a
+	// failed write must not kill the workload.
+	prefix += "\nhostname -f > " + path + "/compute-node || true"
+
 	sbatch_macros := "#!" + config.BashPath +
 		"\n#SBATCH --job-name=" + podUID +
 		"\n#SBATCH --output=" + path + "/job.out" +
