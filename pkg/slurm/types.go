@@ -126,6 +126,17 @@ const (
 	// GangRoleHead / GangRoleWorker are the two recognised role values.
 	GangRoleHead   = "head"
 	GangRoleWorker = "worker"
+
+	// GangModeAnnotation selects how the gang is launched inside the one
+	// co-scheduled sbatch. Absent/empty is the DEFAULT per-rank mode: one
+	// `srun --overlap --nodes=1 --ntasks=1` per member, each a self-contained
+	// process that finds peers via the injected MASTER_ADDR/RANK/WORLD_SIZE env
+	// (the correct model for Ray and torch-distributed). Value "mpi" selects the
+	// classic-MPI mode: ONE collective launcher srun spans the whole allocation
+	// (one MPI rank per node) and non-head members render no srun.
+	GangModeAnnotation = "interlink.eu/gang-mode"
+	// GangModeMPI is the GangModeAnnotation value that selects classic-MPI mode.
+	GangModeMPI = "mpi"
 )
 
 // BufferedMember holds everything produceGangSLURMScript needs to render one

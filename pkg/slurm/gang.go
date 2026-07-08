@@ -264,6 +264,22 @@ func produceGangSLURMScript(
 		body.WriteString(config.Commandprefix + "\n\n")
 	}
 
+	// HPC-tuning hook (BOTH modes): the head pod's slurm-job.vk.io/mpi-env
+	// annotation ("K=V;K=V") is materialized as `export SINGULARITYENV_<K>=<V>`
+	// in the batch shell BEFORE the launch section. Singularity's SINGULARITYENV_
+	// prefix mechanism MERGES these into every rank's container env (it does NOT
+	// clobber the per-rank --env-file that carries MASTER_ADDR/RANK/WORLD_SIZE, so
+	// torch can inject NCCL_* / UCX_* env here without breaking rendezvous). The
+	// exports also stay visible to the host launcher (UCX/PMIx server side) for the
+	// MPI path. Empty/malformed pairs (no '=', empty key) are skipped.
+	if exports := gangMPIEnvExports(head.Pod.ObjectMeta); len(exports) > 0 {
+		body.WriteString("# --- HPC tuning env (slurm-job.vk.io/mpi-env -> SINGULARITYENV_*; merged into every rank) ---\n")
+		for _, e := range exports {
+			body.WriteString(e + "\n")
+		}
+		body.WriteString("\n")
+	}
+
 	// Deterministic head-node discovery for the shadow/tunnel pods. The batch
 	// script executes on nodes[0], which IS rank 0's (the head's) node, so
 	// `hostname -f` here is the head node. Publish it under a well-known,
@@ -290,6 +306,39 @@ func produceGangSLURMScript(
 	body.WriteString("export RAY_ADDRESS=\"$head_ip:" + strconv.Itoa(port) + "\"\n")
 	body.WriteString(`echo "gang " ` + shellescape.Quote(entry.Name) + ` " head_node=$head_node head_ip=$head_ip world_size=` + strconv.Itoa(n) + `"` + "\n\n")
 
+	// --- launch section --------------------------------------------------------
+	// Two mutually-exclusive shapes, selected by the HEAD pod's
+	// interlink.eu/gang-mode annotation:
+	//   - "mpi": ONE collective launcher srun spanning the whole allocation (one
+	//     MPI rank per node); non-head members render no srun. PMIx does the
+	//     rendezvous, so no MASTER_ADDR / readiness barrier / DRIVER_RC bookkeeping.
+	//   - absent/empty (DEFAULT): the original per-rank model - one
+	//     `srun --overlap --nodes=1 --ntasks=1` per member, a readiness barrier,
+	//     and DRIVER_RC = rank-0's rc. Correct for Ray and torch-distributed.
+	if strings.EqualFold(strings.TrimSpace(head.Pod.ObjectMeta.Annotations[GangModeAnnotation]), GangModeMPI) {
+		emitGangMPILauncher(&body, head, n)
+	} else {
+		emitGangPerRankLaunch(&body, ordered, n, port)
+	}
+
+	// --- write job.slurm -------------------------------------------------------
+	scriptPath := headPath + "/job.slurm"
+	full := hdr.String() + "\n" + body.String()
+	if err := os.WriteFile(scriptPath, []byte(full), 0o774); err != nil {
+		log.G(Ctx).Error("Unable to write gang job.slurm ", scriptPath, ": ", err)
+		return "", err
+	}
+	log.G(Ctx).Infof("Rendered gang sbatch for '%s' (%d nodes) at %s", entry.Name, n, scriptPath)
+	return scriptPath, nil
+}
+
+// emitGangPerRankLaunch renders the DEFAULT per-rank launch section (Ray/torch):
+// one `srun --overlap --nodes=1 --ntasks=1` per member, a readiness barrier
+// before the workers, and DRIVER_RC = rank-0's rc as the whole-gang result. This
+// is the original, unchanged behavior; the MPI path lives in
+// emitGangMPILauncher.
+func emitGangPerRankLaunch(bodyPtr *strings.Builder, ordered []*BufferedMember, n, port int) {
+	body := bodyPtr
 	// Track background PIDs so we can wait/teardown.
 	body.WriteString("declare -a RANK_PIDS=()\n\n")
 
@@ -371,16 +420,144 @@ func produceGangSLURMScript(
 	body.WriteString("wait 2>/dev/null || true\n")
 	body.WriteString("echo \"DRIVER_RC=$DRIVER_RC\"\n")
 	body.WriteString("exit \"$DRIVER_RC\"\n")
+}
 
-	// --- write job.slurm -------------------------------------------------------
-	scriptPath := headPath + "/job.slurm"
-	full := hdr.String() + "\n" + body.String()
-	if err := os.WriteFile(scriptPath, []byte(full), 0o774); err != nil {
-		log.G(Ctx).Error("Unable to write gang job.slurm ", scriptPath, ": ", err)
-		return "", err
+// emitGangMPILauncher renders the classic-MPI launch section: ONE collective
+// srun spanning the whole allocation, one MPI rank per node. It is selected only
+// when the head pod carries interlink.eu/gang-mode=mpi. There is no per-rank
+// loop, no readiness barrier, and no DRIVER_RC bookkeeping - the single srun's rc
+// IS the whole-job rc (the batch shell exits with it because `srun` is the last
+// command and `set -uo pipefail` leaves ${?} unmasked). Non-head members render
+// no srun at all; their pods still get the shared JID back-filled by stampJID for
+// Status / Delete.
+//
+// The container invocation is reconstructed EXACTLY as runCtn does (prepare.go):
+// strings.Join(rc.runtimeCommand, " ") (already includes the singularity exec
+// prefix, mounts, options and the SIF path as its last element) followed by each
+// rc.containerCommand and rc.containerArgs entry, shellescape-quoted.
+//
+// Launcher shape (default): `srun` is the launcher AND the PMIx server; each task
+// == one `singularity exec` == one MPI rank. `--ntasks-per-node=1` puts one rank
+// per node for the first milestone; PMIx does the wireup so no MASTER_ADDR is
+// needed. SRUN_CPUS_PER_TASK is exported because MN5's srun no longer propagates
+// cpus-per-task.
+//
+// TODO(nvhpc/mpirun alternative): the NVIDIA HPC SDK OpenMPI on MN5 ACC must be
+// launched with `mpirun` INSIDE a single-node srun (not `srun --mpi=pmix`), and
+// requires `export SLURM_CPU_BIND=none`. A future gang-mode value (e.g.
+// "mpi-mpirun") can select that second shape: `srun --nodes=1 --ntasks=1 -w
+// "$head_node" singularity exec $SIF mpirun -np $WORLD_SIZE <app>` with
+// SLURM_CPU_BIND=none exported. Left as a documented TODO to avoid overbuilding;
+// the pmix path is the clean HPC-native default.
+func emitGangMPILauncher(bodyPtr *strings.Builder, head *BufferedMember, n int) {
+	body := bodyPtr
+	headOut := head.FilesPath + "/job.out"
+	headErr := head.FilesPath + "/job.err"
+
+	// Reconstruct the container invocation from the head's first (non-init)
+	// runtime command, mirroring runCtn's assembly.
+	invocation := gangReconstructContainerInvocation(head.RuntimeCommands)
+
+	// Guard: a head with no non-init workload container would otherwise emit a
+	// bare `srun ... \` with an empty command. Can't happen on the normal path
+	// (the head always has a workload), but fail loudly rather than silently.
+	if strings.TrimSpace(invocation) == "" {
+		body.WriteString("echo 'gang MPI mode: head has no workload container to launch' >&2\n")
+		body.WriteString("exit 1\n")
+		return
 	}
-	log.G(Ctx).Infof("Rendered gang sbatch for '%s' (%d nodes) at %s", entry.Name, n, scriptPath)
-	return scriptPath, nil
+
+	body.WriteString("# --- classic-MPI launcher (interlink.eu/gang-mode=mpi): ONE srun over the whole allocation ---\n")
+	body.WriteString("# One srun task per node == one MPI rank; PMIx does the rendezvous (no MASTER_ADDR needed).\n")
+	// MN5: srun no longer propagates cpus-per-task; forward it explicitly.
+	body.WriteString(`export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK}"` + "\n")
+	body.WriteString("# Record the head compute node for shadow/tunnel discovery (best-effort).\n")
+	body.WriteString("hostname -f > " + shellescape.Quote(head.FilesPath+"/compute-node") + " || true\n")
+	body.WriteString(`srun --mpi="${SLURM_MPI_TYPE:-pmix}" --nodes="$WORLD_SIZE" --ntasks="$WORLD_SIZE" --ntasks-per-node=1 \` + "\n")
+	body.WriteString("     -o " + shellescape.Quote(headOut) + " -e " + shellescape.Quote(headErr) + " --open-mode=truncate \\\n")
+	body.WriteString("  " + invocation + "\n")
+}
+
+// gangReconstructContainerInvocation rebuilds the container command line the same
+// way runCtn does in prepare.go: join rc.runtimeCommand with spaces (it already
+// includes the singularity exec prefix + mounts/options + the SIF path as its
+// last element), then append each containerCommand and containerArgs entry
+// shellescape-quoted. It uses the FIRST non-init container command (the head's
+// workload). Returns an empty string if there is no usable runtime command.
+func gangReconstructContainerInvocation(rcs []ContainerCommand) string {
+	var rc *ContainerCommand
+	for i := range rcs {
+		if !rcs[i].isInitContainer {
+			rc = &rcs[i]
+			break
+		}
+	}
+	if rc == nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(strings.Join(rc.runtimeCommand, " "))
+	for _, c := range rc.containerCommand {
+		b.WriteString(" ")
+		b.WriteString(shellescape.Quote(c))
+	}
+	for _, a := range rc.containerArgs {
+		b.WriteString(" ")
+		b.WriteString(shellescape.Quote(a))
+	}
+	return b.String()
+}
+
+// gangMPIEnvExports parses the head pod's slurm-job.vk.io/mpi-env annotation
+// ("K=V;K=V") into a slice of `export SINGULARITYENV_<K>=<shellescaped V>` lines.
+// Empty or malformed pairs (no '=', empty key) are skipped. Returns nil when the
+// annotation is absent or yields no valid pairs.
+// isShellEnvName reports whether s is a valid POSIX shell/env variable name:
+// [A-Za-z_][A-Za-z0-9_]*. Used to reject unsafe mpi-env keys before they are
+// interpolated (unquoted) into an `export` statement.
+func isShellEnvName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, r := range s {
+		switch {
+		case r == '_' || (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z'):
+			// always allowed
+		case i > 0 && r >= '0' && r <= '9':
+			// digits allowed after the first char
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func gangMPIEnvExports(metadata metav1.ObjectMeta) []string {
+	raw := strings.TrimSpace(metadata.Annotations["slurm-job.vk.io/mpi-env"])
+	if raw == "" {
+		return nil
+	}
+	var out []string
+	for _, pair := range strings.Split(raw, ";") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		k, v, ok := strings.Cut(pair, "=")
+		k = strings.TrimSpace(k)
+		if !ok || k == "" {
+			continue
+		}
+		// The KEY is interpolated unquoted into `export SINGULARITYENV_<K>=...`, so
+		// only accept valid shell env-var names ([A-Za-z_][A-Za-z0-9_]*). This drops
+		// a hostile key like `X;rm -rf /` before it can break out of the export line
+		// (the value is already shellescaped; this hardens the key side too).
+		if !isShellEnvName(k) {
+			continue
+		}
+		out = append(out, "export SINGULARITYENV_"+k+"="+shellescape.Quote(v))
+	}
+	return out
 }
 
 // slurmJobGone classifies one squeue probe of a submitted gang's JID and

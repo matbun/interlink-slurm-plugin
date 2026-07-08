@@ -1067,8 +1067,13 @@ func buildSbatchFlags(
 	if mpiFlags, ok := metadata.Annotations["slurm-job.vk.io/mpi-flags"]; ok {
 		if mpiFlags != "true" {
 			mpi := append([]string{"mpiexec", "-np", "$SLURM_NTASKS"}, strings.Split(mpiFlags, " ")...)
-			for _, containerCommand := range commands {
-				containerCommand.runtimeCommand = append(mpi, containerCommand.runtimeCommand...)
+			// commands is a []ContainerCommand (value-type elements), so a
+			// `for _, cc := range commands` loop mutates a throwaway COPY and the
+			// prepended mpiexec was silently discarded (dead code). Index into the
+			// slice so the mutation lands on the real element and mpiexec is
+			// actually prepended to each container's runtime command.
+			for i := range commands {
+				commands[i].runtimeCommand = append(append([]string{}, mpi...), commands[i].runtimeCommand...)
 			}
 		}
 	}

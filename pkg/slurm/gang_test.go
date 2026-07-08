@@ -1046,3 +1046,307 @@ func TestGangScriptPublishesGangHeadDiscoveryFile(t *testing.T) {
 		t.Error("the .gang-heads dir must be created before writing into it")
 	}
 }
+
+// --- MPI-mode + mpi-env hook + mpi-flags tests --------------------------------
+
+// mkGangMemberWithRC builds a gang member carrying ONE fully-rendered
+// ContainerCommand (like Create.go's runtime_command_pod[0]): its runtimeCommand
+// already includes the SIF path at the end (mirroring prepareRuntimeCommand +
+// image), plus an explicit containerCommand/containerArgs so the MPI-mode
+// reconstruction has something to rebuild (exactly as runCtn does).
+func mkGangMemberWithRC(t *testing.T, dataRoot, uid, role string, size int, extra map[string]string, cmd, args []string) *BufferedMember {
+	t.Helper()
+	dir := dataRoot + "default-" + uid
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	rc := []ContainerCommand{{
+		containerName: "main",
+		// runtimeCommand mirrors Create.go: singularity exec <opts> <mounts> <SIF>.
+		// The SIF path is the LAST element (rc.runtimeCommand already includes it).
+		runtimeCommand:   []string{"singularity", "exec", "--nv", "--no-home", "", "", "/gpfs/images/itwinai.sif"},
+		containerCommand: cmd,
+		containerArgs:    args,
+		containerImage:   "/gpfs/images/itwinai.sif",
+	}}
+	return gangMemberFromCreate(newGangPod(uid, "g1", role, size, extra), dir, rc, ResourceLimits{}, true, true, nil)
+}
+
+// REGRESSION (critical): with gang-mode ABSENT, produceGangSLURMScript output is
+// UNCHANGED from the per-rank behavior. Covers a KubeRay-style gang (head+worker,
+// Ray env) AND a torch-style gang. Every per-rank srun --overlap loop, the
+// readiness barrier, and the DRIVER_RC tail must all still be present, and NO MPI
+// launcher (`srun --mpi=`) must appear.
+func TestProduceGangSLURMScriptDefaultModeUnchanged(t *testing.T) {
+	run := func(t *testing.T, extra map[string]string) string {
+		dataRoot := t.TempDir() + string(os.PathSeparator)
+		config := SlurmConfig{BashPath: "/bin/bash", Commandprefix: "module load singularity"}
+		entry := &GangEntry{Name: "g1", Size: 2, Members: map[string]*BufferedMember{
+			"h": mkGangMemberWithRC(t, dataRoot, "h", GangRoleHead, 2, extra, []string{"python"}, []string{"train.py"}),
+			"w": mkGangMemberWithRC(t, dataRoot, "w", GangRoleWorker, 2, extra, []string{"python"}, []string{"train.py"}),
+		}}
+		ordered := assignRanks(entry.Members)
+		path, err := produceGangSLURMScript(context.Background(), config, entry, ordered)
+		if err != nil {
+			t.Fatalf("produceGangSLURMScript: %v", err)
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read gang script: %v", err)
+		}
+		return string(b)
+	}
+
+	// KubeRay-style: head+worker, Ray env is present in the coordination block.
+	t.Run("kuberay", func(t *testing.T) {
+		s := run(t, nil)
+		// Per-rank loop for EACH member: 2 member sruns + 1 barrier probe srun = 3.
+		if got := strings.Count(s, "srun --overlap --nodes=1 --ntasks=1"); got != 3 {
+			t.Errorf("default mode must emit one per-rank srun per member plus the barrier probe (3), got %d\n---\n%s", got, s)
+		}
+		// Both member dirs must be routed by their own per-rank srun.
+		if !strings.Contains(s, "default-h/job.out") || !strings.Contains(s, "default-w/job.out") {
+			t.Errorf("default mode must route each member's -o into its own dir\n---\n%s", s)
+		}
+		// Readiness barrier still present.
+		if !strings.Contains(s, "/dev/tcp/$head_ip/$MASTER_PORT") {
+			t.Errorf("default mode must keep the readiness barrier\n---\n%s", s)
+		}
+		// DRIVER_RC tail still present.
+		for _, want := range []string{"DRIVER_RC=0", "wait \"${RANK_PIDS[0]}\"", "exit \"$DRIVER_RC\""} {
+			if !strings.Contains(s, want) {
+				t.Errorf("default mode must keep the DRIVER_RC tail (%q)\n---\n%s", want, s)
+			}
+		}
+		// Ray coordination env present (RAY_ADDRESS is emitted for all gangs today).
+		if !strings.Contains(s, "RAY_ADDRESS=\"$head_ip:6379\"") {
+			t.Errorf("default mode must keep the RAY_ADDRESS coordination env\n---\n%s", s)
+		}
+		// No MPI launcher whatsoever.
+		if strings.Contains(s, "srun --mpi=") {
+			t.Errorf("default mode must NOT emit an MPI launcher\n---\n%s", s)
+		}
+		if strings.Contains(s, "SRUN_CPUS_PER_TASK") {
+			t.Errorf("default mode must NOT emit the MPI SRUN_CPUS_PER_TASK export\n---\n%s", s)
+		}
+	})
+
+	// torch-style: same shape, no Ray specifics needed; the per-rank + barrier +
+	// DRIVER_RC contract is identical (torch consumes MASTER_ADDR/RANK/WORLD_SIZE).
+	t.Run("torch", func(t *testing.T) {
+		s := run(t, map[string]string{"slurm-job.vk.io/singularity-options": "--nv"})
+		// 2 member sruns + 1 barrier probe srun = 3.
+		if got := strings.Count(s, "srun --overlap --nodes=1 --ntasks=1"); got != 3 {
+			t.Errorf("torch default mode must emit one per-rank srun per member plus the barrier probe (3), got %d\n---\n%s", got, s)
+		}
+		if !strings.Contains(s, "/dev/tcp/$head_ip/$MASTER_PORT") {
+			t.Errorf("torch default mode must keep the readiness barrier\n---\n%s", s)
+		}
+		if !strings.Contains(s, "export MASTER_ADDR") || !strings.Contains(s, "WORLD_SIZE=2") {
+			t.Errorf("torch default mode must keep MASTER_ADDR/WORLD_SIZE coordination env\n---\n%s", s)
+		}
+		if strings.Contains(s, "srun --mpi=") {
+			t.Errorf("torch default mode must NOT emit an MPI launcher\n---\n%s", s)
+		}
+	})
+}
+
+// MPI mode: with gang-mode=mpi, exactly ONE srun launcher spanning the whole
+// allocation, NO per-rank overlap loop, NO readiness barrier, the
+// SRUN_CPUS_PER_TASK export, the --mpi= flag, and the singularity exec
+// reconstruction (runtimeCommand join + shellescaped command/args) present.
+func TestProduceGangSLURMScriptMPIMode(t *testing.T) {
+	dataRoot := t.TempDir() + string(os.PathSeparator)
+	config := SlurmConfig{BashPath: "/bin/bash", Commandprefix: "module load singularity"}
+	mpiExtra := map[string]string{GangModeAnnotation: GangModeMPI}
+	entry := &GangEntry{Name: "g1", Size: 2, Members: map[string]*BufferedMember{
+		"h": mkGangMemberWithRC(t, dataRoot, "h", GangRoleHead, 2, mpiExtra, []string{"python"}, []string{"mpi_hello.py"}),
+		"w": mkGangMemberWithRC(t, dataRoot, "w", GangRoleWorker, 2, mpiExtra, []string{"python"}, []string{"mpi_hello.py"}),
+	}}
+	ordered := assignRanks(entry.Members)
+	path, err := produceGangSLURMScript(context.Background(), config, entry, ordered)
+	if err != nil {
+		t.Fatalf("produceGangSLURMScript: %v", err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read gang script: %v", err)
+	}
+	s := string(b)
+
+	// Exactly one MPI launcher srun; zero per-rank overlap sruns.
+	if got := strings.Count(s, "srun --mpi="); got != 1 {
+		t.Errorf("MPI mode must emit exactly ONE MPI launcher srun, got %d\n---\n%s", got, s)
+	}
+	if strings.Contains(s, "srun --overlap --nodes=1 --ntasks=1") {
+		t.Errorf("MPI mode must NOT emit the per-rank overlap loop\n---\n%s", s)
+	}
+	// No readiness barrier in MPI mode (PMIx does the rendezvous).
+	if strings.Contains(s, "/dev/tcp/$head_ip/$MASTER_PORT") {
+		t.Errorf("MPI mode must NOT emit the readiness barrier\n---\n%s", s)
+	}
+	// No DRIVER_RC / RANK_PIDS tail: the single srun rc is the whole-job rc.
+	if strings.Contains(s, "DRIVER_RC") || strings.Contains(s, "RANK_PIDS") {
+		t.Errorf("MPI mode must NOT emit the DRIVER_RC/RANK_PIDS per-rank tail\n---\n%s", s)
+	}
+	// The MN5 SRUN_CPUS_PER_TASK export must be present.
+	if !strings.Contains(s, `export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK}"`) {
+		t.Errorf("MPI mode must export SRUN_CPUS_PER_TASK from SLURM_CPUS_PER_TASK\n---\n%s", s)
+	}
+	// The --mpi flag defaults to pmix (overridable via SLURM_MPI_TYPE).
+	if !strings.Contains(s, `--mpi="${SLURM_MPI_TYPE:-pmix}"`) {
+		t.Errorf("MPI mode must emit --mpi with the pmix default\n---\n%s", s)
+	}
+	// One task per node: --nodes/--ntasks span the whole allocation, one per node.
+	for _, want := range []string{`--nodes="$WORLD_SIZE"`, `--ntasks="$WORLD_SIZE"`, "--ntasks-per-node=1"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("MPI mode launcher missing %q\n---\n%s", want, s)
+		}
+	}
+	// Output routed to the HEAD member's dir.
+	if !strings.Contains(s, "-o "+dataRoot+"default-h/job.out") || !strings.Contains(s, "-e "+dataRoot+"default-h/job.err") {
+		t.Errorf("MPI launcher must route -o/-e to the head member dir\n---\n%s", s)
+	}
+	// The container invocation reconstruction: runtimeCommand joined + the SIF +
+	// the shellescaped command/args (exactly as runCtn does).
+	if !strings.Contains(s, "singularity exec --nv --no-home") {
+		t.Errorf("MPI launcher must reconstruct the singularity exec prefix\n---\n%s", s)
+	}
+	if !strings.Contains(s, "/gpfs/images/itwinai.sif") {
+		t.Errorf("MPI launcher must include the SIF path from runtimeCommand\n---\n%s", s)
+	}
+	if !strings.Contains(s, "python mpi_hello.py") {
+		t.Errorf("MPI launcher must include the shellescaped container command/args\n---\n%s", s)
+	}
+	// Only ONE srun total (the launcher). scontrol hostnames uses srun for head_ip;
+	// count MPI launcher separately above. Non-head members render no srun of
+	// their own -> no second --mpi launcher (asserted above by count==1).
+
+	// The CommandPrefix must still run once at the batch level in MPI mode too.
+	if got := strings.Count(s, "module load singularity"); got != 1 {
+		t.Errorf("MPI mode must still run CommandPrefix once at the batch level, got %d\n---\n%s", got, s)
+	}
+}
+
+// mpi-env hook: SINGULARITYENV_<K> exports appear for a given annotation, in BOTH
+// modes; and are ABSENT when the annotation is unset.
+func TestGangScriptMPIEnvHook(t *testing.T) {
+	renderWith := func(t *testing.T, extra map[string]string) string {
+		dataRoot := t.TempDir() + string(os.PathSeparator)
+		config := SlurmConfig{BashPath: "/bin/bash", Commandprefix: "module load singularity"}
+		entry := &GangEntry{Name: "g1", Size: 2, Members: map[string]*BufferedMember{
+			"h": mkGangMemberWithRC(t, dataRoot, "h", GangRoleHead, 2, extra, []string{"python"}, []string{"t.py"}),
+			"w": mkGangMemberWithRC(t, dataRoot, "w", GangRoleWorker, 2, extra, []string{"python"}, []string{"t.py"}),
+		}}
+		ordered := assignRanks(entry.Members)
+		path, err := produceGangSLURMScript(context.Background(), config, entry, ordered)
+		if err != nil {
+			t.Fatalf("produceGangSLURMScript: %v", err)
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read gang script: %v", err)
+		}
+		return string(b)
+	}
+
+	// Present in DEFAULT (per-rank) mode.
+	t.Run("default-mode", func(t *testing.T) {
+		s := renderWith(t, map[string]string{"slurm-job.vk.io/mpi-env": "NCCL_DEBUG=INFO;UCX_TLS=rc,ud"})
+		for _, want := range []string{
+			`export SINGULARITYENV_NCCL_DEBUG=INFO`,
+			`export SINGULARITYENV_UCX_TLS=`, // value shellescaped; prefix is enough
+		} {
+			if !strings.Contains(s, want) {
+				t.Errorf("default mode must emit mpi-env export %q\n---\n%s", want, s)
+			}
+		}
+		// The exports must precede the launch section (per-rank srun).
+		if e, sr := strings.Index(s, "SINGULARITYENV_NCCL_DEBUG"), strings.Index(s, "srun --overlap"); e < 0 || sr < 0 || e > sr {
+			t.Errorf("mpi-env exports must precede the launch section: env@%d srun@%d\n---\n%s", e, sr, s)
+		}
+	})
+
+	// Present in MPI mode too.
+	t.Run("mpi-mode", func(t *testing.T) {
+		s := renderWith(t, map[string]string{
+			GangModeAnnotation:        GangModeMPI,
+			"slurm-job.vk.io/mpi-env": "UCX_NET_DEVICES=mlx5_0:1",
+		})
+		if !strings.Contains(s, `export SINGULARITYENV_UCX_NET_DEVICES=mlx5_0:1`) {
+			t.Errorf("MPI mode must emit mpi-env export\n---\n%s", s)
+		}
+		if e, sr := strings.Index(s, "SINGULARITYENV_UCX_NET_DEVICES"), strings.Index(s, "srun --mpi="); e < 0 || sr < 0 || e > sr {
+			t.Errorf("mpi-env exports must precede the MPI launcher: env@%d srun@%d\n---\n%s", e, sr, s)
+		}
+	})
+
+	// Absent when the annotation is unset.
+	t.Run("unset", func(t *testing.T) {
+		s := renderWith(t, nil)
+		if strings.Contains(s, "SINGULARITYENV_") {
+			t.Errorf("no mpi-env annotation must emit NO SINGULARITYENV_ exports\n---\n%s", s)
+		}
+	})
+
+	// Malformed/empty pairs are skipped, valid ones still emitted.
+	t.Run("skips-malformed", func(t *testing.T) {
+		s := renderWith(t, map[string]string{"slurm-job.vk.io/mpi-env": "NCCL_DEBUG=INFO;;NOEQUALS;=novalue;GOOD=1"})
+		if !strings.Contains(s, `export SINGULARITYENV_NCCL_DEBUG=INFO`) || !strings.Contains(s, `export SINGULARITYENV_GOOD=1`) {
+			t.Errorf("valid pairs must still be emitted alongside malformed ones\n---\n%s", s)
+		}
+		if strings.Contains(s, "SINGULARITYENV_NOEQUALS") || strings.Contains(s, "SINGULARITYENV_=") {
+			t.Errorf("malformed pairs (no '=', empty key) must be skipped\n---\n%s", s)
+		}
+	})
+
+	// Keys that are not valid shell env-var names are dropped BEFORE the unquoted
+	// `export SINGULARITYENV_<K>` interpolation (hardening the key side; the value
+	// is already shellescaped). A hostile key must not reach the export line.
+	t.Run("rejects-unsafe-key", func(t *testing.T) {
+		s := renderWith(t, map[string]string{"slurm-job.vk.io/mpi-env": "GOOD_1=ok;BAD-KEY=x;E vil=y;X;rm -rf /=z"})
+		if !strings.Contains(s, `export SINGULARITYENV_GOOD_1=ok`) {
+			t.Errorf("valid key GOOD_1 must still be emitted\n---\n%s", s)
+		}
+		for _, bad := range []string{"BAD-KEY", "rm -rf", "E vil", "SINGULARITYENV_X="} {
+			if strings.Contains(s, bad) {
+				t.Errorf("unsafe key fragment %q must not reach the script\n---\n%s", bad, s)
+			}
+		}
+	})
+}
+
+// mpi-flags bug fix: mpiexec is now ACTUALLY prepended to each container's
+// runtimeCommand (previously ranged over a value copy and was discarded).
+func TestBuildSbatchFlagsMPIFlagsPrependsMpiexec(t *testing.T) {
+	commands := []ContainerCommand{
+		{containerName: "a", runtimeCommand: []string{"singularity", "exec", "img.sif"}},
+		{containerName: "b", runtimeCommand: []string{"singularity", "run", "other.sif"}},
+	}
+	meta := metav1.ObjectMeta{Annotations: map[string]string{
+		"slurm-job.vk.io/mpi-flags": "--bind-to core",
+	}}
+	pod := v1.Pod{ObjectMeta: meta}
+
+	_ = buildSbatchFlags(context.Background(), SlurmConfig{}, pod, meta, commands,
+		ResourceLimits{}, true, true, nil, true)
+
+	for i, cc := range commands {
+		if len(cc.runtimeCommand) < 3 {
+			t.Fatalf("command %d runtimeCommand too short: %v", i, cc.runtimeCommand)
+		}
+		if cc.runtimeCommand[0] != "mpiexec" || cc.runtimeCommand[1] != "-np" || cc.runtimeCommand[2] != "$SLURM_NTASKS" {
+			t.Errorf("command %d: mpiexec not prepended (dead-code bug regressed): %v", i, cc.runtimeCommand)
+		}
+		// The user-supplied flags follow, then the original runtime command.
+		joined := strings.Join(cc.runtimeCommand, " ")
+		if !strings.Contains(joined, "--bind-to core") {
+			t.Errorf("command %d: mpi-flags args not included: %q", i, joined)
+		}
+		if !strings.Contains(joined, "singularity") {
+			t.Errorf("command %d: original runtime command lost: %q", i, joined)
+		}
+	}
+	// mpiexec must NOT leak into the returned #SBATCH flags.
+	// (buildSbatchFlags return value is scheduler flags only.)
+}
