@@ -220,11 +220,33 @@ func produceGangSLURMScript(
 	flags := buildSbatchFlags(Ctx, config, head.Pod, head.Pod.ObjectMeta, head.RuntimeCommands,
 		head.ResourceLimits, head.IsDefaultCPU, head.IsDefaultRam, head.Flavor, true /*suppressDefaultMem*/)
 
+	// --- launcher selection (injected-launcher path) --------------------------
+	// interlink.eu/launcher picks a launcher file from the registry ConfigMap; its
+	// declared topology (per-rank | collective) replaces the old gang-mode branch.
+	// Loaded + validated FRESH here (crash-no-fallback: a bad launcher fails the
+	// whole submit rather than silently reverting to a built-in default).
+	gpusPerNode := gpusPerNodeFromFlags(flags)
+	launcherName := selectedLauncherName(head.Pod.ObjectMeta)
+	var launcher *launcherDef
+	if launcherName != "" {
+		ld, lerr := loadLauncher(Ctx, config, launcherName)
+		if lerr != nil {
+			return "", fmt.Errorf("gang %s: %w", entry.Name, lerr)
+		}
+		launcher = ld
+	}
+	// #SBATCH --ntasks-per-node: a collective launcher over GPUs wants one task per
+	// GPU (gang6: QUDA's Ntask = total GPUs); everything else is one task per node.
+	tasksPerNode := 1
+	if launcher != nil && launcher.Topology == LauncherTopologyCollective && gpusPerNode > 0 {
+		tasksPerNode = gpusPerNode
+	}
+
 	var hdr strings.Builder
 	hdr.WriteString("#!" + config.BashPath + "\n")
 	hdr.WriteString("#SBATCH --job-name=" + entry.Name + "\n")
 	hdr.WriteString("#SBATCH --nodes=" + strconv.Itoa(n) + "\n")
-	hdr.WriteString("#SBATCH --ntasks-per-node=1\n")
+	hdr.WriteString("#SBATCH --ntasks-per-node=" + strconv.Itoa(tasksPerNode) + "\n")
 	// Batch-body stdout/stderr (driver output) lands in the head member's dir so
 	// the plugin harvests it as the head pod's job.out (per-pod-dir log model).
 	hdr.WriteString("#SBATCH --output=" + headPath + "/job.out\n")
@@ -304,20 +326,34 @@ func produceGangSLURMScript(
 	body.WriteString("export MASTER_PORT=" + strconv.Itoa(port) + "\n")
 	body.WriteString("export WORLD_SIZE=" + strconv.Itoa(n) + "\n")
 	body.WriteString("export RAY_ADDRESS=\"$head_ip:" + strconv.Itoa(port) + "\"\n")
-	body.WriteString(`echo "gang " ` + shellescape.Quote(entry.Name) + ` " head_node=$head_node head_ip=$head_ip world_size=` + strconv.Itoa(n) + `"` + "\n\n")
+	body.WriteString(`echo "gang " ` + shellescape.Quote(entry.Name) + ` " head_node=$head_node head_ip=$head_ip world_size=` + strconv.Itoa(n) + `"` + "\n")
+	// Gang topology exported for injected launchers (launcher_main reads these).
+	body.WriteString("export GANG_NNODES=" + strconv.Itoa(n) + "\n")
+	body.WriteString("export GANG_GPUS_PER_NODE=" + strconv.Itoa(gpusPerNode) + "\n\n")
 
 	// --- launch section --------------------------------------------------------
-	// Two mutually-exclusive shapes, selected by the HEAD pod's
-	// interlink.eu/gang-mode annotation:
-	//   - "mpi": ONE collective launcher srun spanning the whole allocation (one
-	//     MPI rank per node); non-head members render no srun. PMIx does the
-	//     rendezvous, so no MASTER_ADDR / readiness barrier / DRIVER_RC bookkeeping.
-	//   - absent/empty (DEFAULT): the original per-rank model - one
-	//     `srun --overlap --nodes=1 --ntasks=1` per member, a readiness barrier,
-	//     and DRIVER_RC = rank-0's rc. Correct for Ray and torch-distributed.
-	if strings.EqualFold(strings.TrimSpace(head.Pod.ObjectMeta.Annotations[GangModeAnnotation]), GangModeMPI) {
+	// Selection order (see gang CLAUDE.md):
+	//   1. interlink.eu/launcher present -> injected launcher; its declared topology
+	//      picks per-rank (emitLauncherPerRank) vs collective (emitLauncherCollective).
+	//   2. else interlink.eu/gang-mode=mpi (DEPRECATED alias) -> built-in collective MPI.
+	//   3. else (DEFAULT) -> built-in per-rank model (Ray / torch-distributed): one
+	//      `srun --overlap --nodes=1 --ntasks=1` per member + readiness barrier +
+	//      DRIVER_RC = rank-0's rc.
+	switch {
+	case launcher != nil:
+		launcherPath, werr := writeLauncherFile(headPath, launcher)
+		if werr != nil {
+			return "", fmt.Errorf("gang %s: %w", entry.Name, werr)
+		}
+		if launcher.Topology == LauncherTopologyCollective {
+			emitLauncherCollective(&body, head, launcher, launcherPath)
+		} else {
+			emitLauncherPerRank(&body, ordered, launcher, launcherPath, n, port)
+		}
+	case strings.EqualFold(strings.TrimSpace(head.Pod.ObjectMeta.Annotations[GangModeAnnotation]), GangModeMPI):
+		log.G(Ctx).Warningf("gang %s: interlink.eu/gang-mode=mpi is DEPRECATED; migrate to interlink.eu/launcher (e.g. mpi-openmpi). Using the built-in collective-MPI shape.", entry.Name)
 		emitGangMPILauncher(&body, head, n)
-	} else {
+	default:
 		emitGangPerRankLaunch(&body, ordered, n, port)
 	}
 
@@ -476,6 +512,107 @@ func emitGangMPILauncher(bodyPtr *strings.Builder, head *BufferedMember, n int) 
 	body.WriteString(`srun --mpi="${SLURM_MPI_TYPE:-pmix}" --nodes="$WORLD_SIZE" --ntasks="$WORLD_SIZE" --ntasks-per-node=1 \` + "\n")
 	body.WriteString("     -o " + shellescape.Quote(headOut) + " -e " + shellescape.Quote(headErr) + " --open-mode=truncate \\\n")
 	body.WriteString("  " + invocation + "\n")
+}
+
+// emitLauncherCollective renders the COLLECTIVE injected-launcher section:
+// launcher_main runs ONCE from the batch script (on node[0]) and itself fans out
+// over the whole allocation (classic MPI openmpi/mpich, or the Ray cluster
+// bootstrap). It mirrors emitGangMPILauncher's contract (the single launch's rc is
+// the job rc; non-head members render no srun) but the launch SHAPE comes from the
+// injected launcher_main instead of a hardcoded srun. The head's container-exec
+// prefix is exported as GANG_CONTAINER and its app argv passed to launcher_main.
+func emitLauncherCollective(bodyPtr *strings.Builder, head *BufferedMember, def *launcherDef, launcherPath string) {
+	body := bodyPtr
+	prefix, appArgs, _, ok := launcherWorkload(head.RuntimeCommands)
+	if !ok {
+		body.WriteString("echo 'gang launcher (collective): head has no workload container to launch' >&2\n")
+		body.WriteString("exit 1\n")
+		return
+	}
+	body.WriteString("# --- injected launcher '" + def.Name + "' (collective): launcher_main runs ONCE over the allocation ---\n")
+	// MN5: srun no longer propagates cpus-per-task; forward it explicitly.
+	body.WriteString(`export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK}"` + "\n")
+	// GANG_CONTAINER = the singularity/enroot exec prefix (opts + SIF); the launcher
+	// composes it with the app, e.g. `srun ... $GANG_CONTAINER "$@"` or
+	// `mpirun ... $GANG_CONTAINER "$@"`. Used unquoted so it word-splits into argv.
+	body.WriteString("export GANG_CONTAINER=" + shellescape.Quote(prefix) + "\n")
+	body.WriteString("# Record the head compute node for shadow/tunnel discovery (best-effort).\n")
+	body.WriteString("hostname -f > " + shellescape.Quote(head.FilesPath+"/compute-node") + " || true\n")
+	body.WriteString("source " + shellescape.Quote(launcherPath) + "\n")
+	body.WriteString("launcher_main " + shellescapeArgs(appArgs) + "\n")
+	body.WriteString("LAUNCHER_RC=$?\n")
+	body.WriteString("echo \"gang launcher '" + def.Name + "' exited rc=$LAUNCHER_RC\"\n")
+	body.WriteString("exit \"$LAUNCHER_RC\"\n")
+}
+
+// emitLauncherPerRank renders the PER-RANK injected-launcher section: like
+// emitGangPerRankLaunch (one `srun --overlap` per member, readiness barrier,
+// DRIVER_RC = rank-0's rc), but each rank runs `source launcher.sh; launcher_main
+// <app>` instead of the member's job.sh. Per-pod logs come from the srun -o/-e;
+// per-pod status is written as run-<container>.status from launcher_main's rc so
+// Status.go's gang branch still diverges per pod. GANG_NNODES/GANG_GPUS_PER_NODE and
+// RANK/WORLD_SIZE/MASTER_* reach each rank via `srun --export` from the batch shell.
+// NOTE: this path targets single-workload-container pods (the norm for distributed
+// jobs); init containers / probes / multi-container pods should use the default
+// (no-launcher) path, which runs the full job.sh.
+func emitLauncherPerRank(bodyPtr *strings.Builder, ordered []*BufferedMember, def *launcherDef, launcherPath string, n, port int) {
+	body := bodyPtr
+	body.WriteString("declare -a RANK_PIDS=()\n\n")
+
+	emitRank := func(m *BufferedMember) {
+		node := "${nodes[" + strconv.Itoa(m.Rank) + "]}"
+		out := m.FilesPath + "/job.out"
+		errOut := m.FilesPath + "/job.err"
+		prefix, appArgs, ctnName, ok := launcherWorkload(m.RuntimeCommands)
+		if !ok {
+			body.WriteString("# rank " + strconv.Itoa(m.Rank) + " (" + m.Role + ") pod " + m.PodUID + ": no workload container; skipping\n\n")
+			return
+		}
+		statusFile := m.FilesPath + "/run-" + ctnName + ".status"
+		// Inner (fresh srun sub-shell): set THIS member's container prefix, record its
+		// compute node, source the launcher, run launcher_main with the app argv, and
+		// persist rc as this rank's per-pod status file.
+		inner := "export GANG_CONTAINER=" + shellescape.Quote(prefix) + "\n" +
+			"hostname -f > " + shellescape.Quote(m.FilesPath+"/compute-node") + " || true\n" +
+			"source " + shellescape.Quote(launcherPath) + "\n" +
+			"launcher_main " + shellescapeArgs(appArgs) + "\n" +
+			"RC=$?\n" +
+			"echo \"$RC\" > " + shellescape.Quote(statusFile) + " || true\n" +
+			"exit \"$RC\""
+		body.WriteString("# rank " + strconv.Itoa(m.Rank) + " (" + m.Role + ") pod " + m.PodUID + " via launcher '" + def.Name + "'\n")
+		body.WriteString("srun --overlap --nodes=1 --ntasks=1 -w \"" + node + "\" \\\n")
+		body.WriteString("     --export=ALL,RANK=" + strconv.Itoa(m.Rank) + ",WORLD_SIZE=" + strconv.Itoa(n) +
+			",MASTER_ADDR=\"$head_ip\",MASTER_PORT=" + strconv.Itoa(port) +
+			",RAY_ADDRESS=\"$head_ip:" + strconv.Itoa(port) + "\" \\\n")
+		body.WriteString("     -o " + shellescape.Quote(out) + " -e " + shellescape.Quote(errOut) + " --open-mode=truncate \\\n")
+		body.WriteString("  bash -c " + shellescape.Quote(inner) + " &\n")
+		body.WriteString("RANK_PIDS+=($!)\n\n")
+	}
+
+	// Head first, then a readiness barrier, then the workers (mirrors emitGangPerRankLaunch).
+	emitRank(ordered[0])
+	if n > 1 {
+		body.WriteString("# readiness barrier: wait for the head coordinator before launching workers\n")
+		body.WriteString("head_ready=0\n")
+		body.WriteString("for i in $(seq 1 60); do\n")
+		body.WriteString("  if srun --overlap --nodes=1 --ntasks=1 -w \"$head_node\" bash -c \"exec 3<>/dev/tcp/$head_ip/$MASTER_PORT\" >/dev/null 2>&1; then head_ready=1; break; fi\n")
+		body.WriteString("  sleep 2\n")
+		body.WriteString("done\n")
+		body.WriteString("echo \"gang head_ready=$head_ready\"\n\n")
+		for _, m := range ordered[1:] {
+			emitRank(m)
+		}
+	}
+
+	body.WriteString("# Wait for the head (rank 0 / driver) and capture its rc as the gang result.\n")
+	body.WriteString("DRIVER_RC=0\n")
+	body.WriteString("if [ \"${#RANK_PIDS[@]}\" -gt 0 ]; then\n")
+	body.WriteString("  wait \"${RANK_PIDS[0]}\"; DRIVER_RC=$?\n")
+	body.WriteString("fi\n")
+	body.WriteString("for pid in \"${RANK_PIDS[@]:1}\"; do kill \"$pid\" 2>/dev/null || true; done\n")
+	body.WriteString("wait 2>/dev/null || true\n")
+	body.WriteString("echo \"DRIVER_RC=$DRIVER_RC\"\n")
+	body.WriteString("exit \"$DRIVER_RC\"\n")
 }
 
 // gangReconstructContainerInvocation rebuilds the container command line the same

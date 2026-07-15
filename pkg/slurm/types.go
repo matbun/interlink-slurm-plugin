@@ -99,6 +99,12 @@ type SlurmConfig struct {
 	// abandoned (its buffered members' dirs removed and the entry dropped).
 	// Parsed as a Go duration string (e.g. "10m", "30s"). Empty => 10m.
 	GangTimeout string `yaml:"GangTimeout"`
+	// LauncherRegistryPath is the directory (a mounted ConfigMap) holding the
+	// injected launcher definitions (`<name>.sh`), selected per pod by the
+	// interlink.eu/launcher annotation. Read FRESH at gang-submit time so a
+	// ConfigMap edit hot-reloads without a plugin restart. Empty => the default
+	// /etc/interlink/launchers. See interlink-vk/in-cluster-bsc/gang/CLAUDE.md.
+	LauncherRegistryPath string `yaml:"LauncherRegistryPath"`
 }
 
 type CreateStruct struct {
@@ -137,6 +143,14 @@ const (
 	GangModeAnnotation = "interlink.eu/gang-mode"
 	// GangModeMPI is the GangModeAnnotation value that selects classic-MPI mode.
 	GangModeMPI = "mpi"
+
+	// LauncherAnnotation selects an injected launcher (by name) from the registry
+	// ConfigMap (SlurmConfig.LauncherRegistryPath). It SUPERSEDES GangModeAnnotation:
+	// the per-rank-vs-collective topology is a property declared inside the launcher
+	// file, not a separate annotation. Precedence: LauncherAnnotation wins; else the
+	// deprecated GangModeAnnotation=mpi alias; else the built-in default per-rank path.
+	// See interlink-vk/in-cluster-bsc/gang/CLAUDE.md.
+	LauncherAnnotation = "interlink.eu/launcher"
 )
 
 // BufferedMember holds everything produceGangSLURMScript needs to render one

@@ -133,6 +133,12 @@ func NewSlurmConfig() (SlurmConfig, error) {
 		if SlurmConfigInst.GangTimeout == "" {
 			SlurmConfigInst.GangTimeout = "10m"
 		}
+		if os.Getenv("LAUNCHERREGISTRYPATH") != "" {
+			SlurmConfigInst.LauncherRegistryPath = os.Getenv("LAUNCHERREGISTRYPATH")
+		}
+		if SlurmConfigInst.LauncherRegistryPath == "" {
+			SlurmConfigInst.LauncherRegistryPath = "/etc/interlink/launchers"
+		}
 		if SlurmConfigInst.GangSchedulingEnabled {
 			// Reject exactly what the runtime (gangGuaranteeTimeout) would refuse to
 			// honour: an unparseable duration OR a non-positive one (e.g. "0s").
