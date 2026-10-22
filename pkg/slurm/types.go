@@ -3,6 +3,9 @@ package slurm
 import (
 	"fmt"
 	"strings"
+	"time"
+
+	v1 "k8s.io/api/core/v1"
 )
 
 // FlavorConfig holds the configuration for a specific flavor
@@ -110,11 +113,108 @@ type SlurmConfig struct {
 	// where jobs run under more than one UID (DefaultUID, flavor UID or
 	// runAsUser): a job whose account cannot write the root fails at start.
 	SocketDirRoot string `yaml:"SocketDirRoot"`
+
+	// Gang scheduling. When GangSchedulingEnabled is false (the
+	// default) the plugin behaves exactly as before: 1 Pod = 1 sbatch. When
+	// enabled, pods carrying the `interlink.eu/gang-name` annotation are
+	// BUFFERED in the plugin and submitted together as a single co-scheduled
+	// `sbatch --nodes=N` job. Pods WITHOUT that annotation always take the
+	// unchanged single-pod path, regardless of this flag.
+	GangSchedulingEnabled bool   `yaml:"GangSchedulingEnabled"` // default false
+	// GangTimeout is how long an incomplete gang is buffered before being
+	// abandoned (its buffered members' dirs removed and the entry dropped).
+	// Parsed as a Go duration string (e.g. "10m", "30s"). Empty => 10m.
+	GangTimeout string `yaml:"GangTimeout"`
+	// LauncherRegistryPath is the directory (a mounted ConfigMap) holding the
+	// injected launcher definitions (`<name>.sh`), selected per pod by the
+	// interlink.eu/launcher annotation. Read FRESH at gang-submit time so a
+	// ConfigMap edit hot-reloads without a plugin restart. Empty => the default
+	// /etc/interlink/launchers. See interlink-vk/in-cluster-bsc/gang/CLAUDE.md.
+	LauncherRegistryPath string `yaml:"LauncherRegistryPath"`
 }
 
 type CreateStruct struct {
 	PodUID string `json:"PodUID"`
 	PodJID string `json:"PodJID"`
+}
+
+// Gang keys. A gang is a Kueue pod group: label kueue.x-k8s.io/pod-group-name and
+// annotation kueue.x-k8s.io/pod-group-total-count, so the group Kueue admits whole is
+// the group submitted as one job. Rank and role come from the labels the controllers
+// already set (Job completion index, Ray node type, JobSet launcher). The
+// interlink.eu/gang-* keys are still read when the Kueue ones are absent.
+const (
+	PodGroupNameLabel            = "kueue.x-k8s.io/pod-group-name"
+	PodGroupTotalCountAnnotation = "kueue.x-k8s.io/pod-group-total-count"
+	JobCompletionIndexLabel      = "batch.kubernetes.io/job-completion-index"
+	RayNodeTypeLabel             = "ray.io/node-type"
+	JobSetReplicatedJobLabel     = "jobset.sigs.k8s.io/replicatedjob-name"
+
+	// GangNameAnnotation is the co-allocation key. All pods sharing the same
+	// value are buffered and submitted as ONE `sbatch --nodes=N` job. Its
+	// presence (with GangSchedulingEnabled) is what triggers the gang path.
+	GangNameAnnotation = "interlink.eu/gang-name"
+	// GangSizeAnnotation is the integer N: both the buffering quorum and the
+	// `#SBATCH --nodes=N`. Required on every gang member.
+	GangSizeAnnotation = "interlink.eu/gang-size"
+	// GangRoleAnnotation is "head" or "worker" (default "worker"). role=head is
+	// forced to rank 0.
+	GangRoleAnnotation = "interlink.eu/gang-role"
+	// GangRankAnnotation is an optional explicit rank in 0..N-1. When absent,
+	// ranks are assigned by arrival order (with head pinned to rank 0).
+	GangRankAnnotation = "interlink.eu/gang-rank"
+
+	// GangRoleHead / GangRoleWorker are the two recognised role values.
+	GangRoleHead   = "head"
+	GangRoleWorker = "worker"
+
+	// GangModeAnnotation selects how the gang is launched inside the one
+	// co-scheduled sbatch. Absent/empty is the DEFAULT per-rank mode: one
+	// `srun --overlap --nodes=1 --ntasks=1` per member, each a self-contained
+	// process that finds peers via the injected MASTER_ADDR/RANK/WORLD_SIZE env
+	// (the correct model for Ray and torch-distributed). Value "mpi" selects the
+	// classic-MPI mode: ONE collective launcher srun spans the whole allocation
+	// (one MPI rank per node) and non-head members render no srun.
+	GangModeAnnotation = "interlink.eu/gang-mode"
+	// GangModeMPI is the GangModeAnnotation value that selects classic-MPI mode.
+	GangModeMPI = "mpi"
+
+	// LauncherAnnotation selects an injected launcher (by name) from the registry
+	// ConfigMap (SlurmConfig.LauncherRegistryPath). It SUPERSEDES GangModeAnnotation:
+	// the per-rank-vs-collective topology is a property declared inside the launcher
+	// file, not a separate annotation. Precedence: LauncherAnnotation wins; else the
+	// deprecated GangModeAnnotation=mpi alias; else the built-in default per-rank path.
+	// See interlink-vk/in-cluster-bsc/gang/CLAUDE.md.
+	LauncherAnnotation = "interlink.eu/launcher"
+)
+
+// BufferedMember holds everything produceGangSLURMScript needs to render one
+// gang member's own rank line (its already-rendered singularity/enroot runtime
+// command, its per-pod files dir for isolated logs, its role/rank, and the pod
+// itself for command/args). One BufferedMember == one rank on one node.
+type BufferedMember struct {
+	PodUID          string
+	Namespace       string
+	FilesPath       string // per-pod dir (DataRootFolder + ns + "-" + uid): job.sh, JobID.jid, logs
+	Role            string // GangRoleHead or GangRoleWorker
+	Rank            int    // 0..N-1; head is always 0
+	Pod             v1.Pod
+	RuntimeCommands []ContainerCommand // this member's own rendered container commands
+	ResourceLimits  ResourceLimits
+	IsDefaultCPU    bool
+	IsDefaultRam    bool
+	Flavor          *FlavorResolution
+}
+
+// GangEntry is the buffer for a single gang (keyed by gang-name in GangTable).
+// It accumulates members until len(Members) == Size, then submits ONE sbatch.
+type GangEntry struct {
+	Name      string
+	Size      int
+	Members   map[string]*BufferedMember // keyed by PodUID
+	JID       string                     // the shared SLURM job ID once submitted
+	Submitted bool
+	CreatedAt time.Time
 }
 
 type ProbeType string

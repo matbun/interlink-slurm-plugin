@@ -50,6 +50,16 @@ func (h *SidecarHandler) StopHandler(w http.ResponseWriter, r *http.Request) {
 
 	filesPath := h.Config.DataRootFolder + pod.Namespace + "-" + string(pod.UID)
 
+	// Drop this pod from its gang buffer (if any) before deleting the container.
+	// interLink /delete is per-pod, so the N members of a gang arrive as N
+	// separate deletes. This is safe at ANY lifecycle point:
+	//   - buffered member (gang not yet submitted, so no JIDs entry): removed from
+	//     the buffer here; deleteContainer's guarded jid read skips scancel; the
+	//     GangEntry is dropped when its buffer empties.
+	//   - submitted member (shared gang JID present): still removed from the entry;
+	//     deleteContainer refcounts the shared JID and scancels only on the last
+	//     member. A no-op for non-gang pods.
+	h.removeGangMemberOnDelete(spanCtx, string(pod.UID))
 	// Resolve the job working directory.
 	// Priority: 1) in-memory JIDs cache  2) pod annotation (handles wiped cache)
 	workDir := getJobWorkDir(h.Config, pod.Annotations, pod.Namespace, string(pod.UID))
@@ -69,8 +79,23 @@ func (h *SidecarHandler) StopHandler(w http.ResponseWriter, r *http.Request) {
 		containerDeletePath = filesPath
 	}
 
-	err = deleteContainer(spanCtx, h.Config, string(pod.UID), h.JIDs, containerDeletePath)
+	// Split the delete so GangMu is held ONLY for the fast, must-be-consistent
+	// scancel decision (refcount read + scancel + removeJID), and RELEASED before
+	// the slow filesystem cleanup (RemoveAll, which can sleep 5s in follow mode).
+	// Holding GangMu across that sleep would stall every concurrent gang
+	// Create/Delete/sweeper. Under the narrow lock exactly one delete sees the JID
+	// refcount reach 1 and issues the single scancel.
+	h.GangMu.Lock()
+	jid, scancelErr := scancelDecideAndRemoveJID(spanCtx, h.Config, string(pod.UID), h.JIDs)
+	h.GangMu.Unlock()
+	if scancelErr != nil {
+		statusCode = http.StatusInternalServerError
+		h.handleError(spanCtx, w, statusCode, scancelErr)
+		return
+	}
 
+	// Filesystem cleanup runs unlocked.
+	err = removeJobFilesWithRetry(spanCtx, span, string(pod.UID), jid, containerDeletePath)
 	if err != nil {
 		statusCode = http.StatusInternalServerError
 		h.handleError(spanCtx, w, statusCode, err)
