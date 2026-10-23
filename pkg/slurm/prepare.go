@@ -55,9 +55,7 @@ type SidecarHandler struct {
 }
 
 var (
-	prefix       string
-	timer        time.Time
-	cachedStatus []commonIL.PodStatus
+	prefix string
 	// jidSubmitRe extracts the numeric SLURM job ID from sbatch output. Shared by
 	// handleJidAndPodUid (single-pod) and parseJIDFromSubmit (gang).
 	jidSubmitRe = regexp.MustCompile(`Submitted batch job (?P<jid>\d+)`)
@@ -606,7 +604,6 @@ func resolveFlavor(Ctx context.Context, config SlurmConfig, metadata metav1.Obje
 		SlurmFlags:    selectedFlavor.SlurmFlags,
 	}, nil
 }
-
 
 // normalizeVolumeFileContent converts a volume file string value to bytes, normalizing
 // literal backslash-n escape sequences (\n) to actual newline characters when the
@@ -1280,16 +1277,21 @@ func buildSbatchFlags(
 		}
 	}
 
-	// Map GPU resources from the pod spec (nvidia.com/gpu, amd.com/gpu) to --gres.
-	// An explicit GPU request coming from the flavor or from the annotation flags
-	// always wins: it can name a specific model (--gres gpu:nvidia-h100:2), which
-	// the pod spec cannot express.
+	// Map GPU resources from the pod spec (nvidia.com/gpu, amd.com/gpu) to the
+	// site's GPU flag (config GPUFlag, --gres by default). An explicit GPU request
+	// coming from the flavor or from the annotation flags always wins: it can name a
+	// specific model (--gres gpu:nvidia-h100:2), which the pod spec cannot express.
 	if gpuCount := detectGPUResources(Ctx, pod.Spec.Containers); gpuCount > 0 {
 		gpuGres := "gpu:" + strconv.FormatInt(gpuCount, 10)
 
-		if slices.ContainsFunc(sbatchFlagsFromArgo, declaresGPUs) {
+		switch {
+		case slices.ContainsFunc(sbatchFlagsFromArgo, declaresGPUs):
 			log.G(Ctx).Infof("Ignoring the %d GPU(s) requested in the pod resources, GPUs are already requested through SLURM flags", gpuCount)
-		} else {
+		case config.GPUFlag == GPUFlagGPUsPerNode || config.GPUFlag == GPUFlagGPUs:
+			flag := "--" + config.GPUFlag + "=" + strconv.FormatInt(gpuCount, 10)
+			sbatchFlagsFromArgo = append(sbatchFlagsFromArgo, flag)
+			log.G(Ctx).Infof("Requesting %d GPU(s) from the pod resources with %s", gpuCount, flag)
+		default:
 			// Merge into an existing non-GPU --gres (e.g. --gres=lscratch:10) instead
 			// of appending a second one, since deduplication keeps only one per flag.
 			merged := false
@@ -1446,10 +1448,14 @@ func produceSLURMScript(
 	}
 
 	// The pod's private directory for unix sockets, which the shadow tunnel connects
-	// to. The job creates it on the node as its own user; mkdir without -p refuses a
-	// directory somebody else created, and the job fails rather than adopt it. This
-	// runs before the compute node is recorded, so a reported node means the
-	// directory exists. The trap is set here and not in job.sh, which has its own.
+	// to. The job creates it on the node as its own user. rm -rf clears what an
+	// earlier run of the same pod left behind (a requeue, or a job killed before its
+	// trap ran); it cannot empty a directory another account created, so mkdir
+	// without -p then fails and the job fails rather than adopt it. Two jobs of the
+	// same pod at once would share this directory, as they already share the job
+	// directory. This runs before the compute node is recorded, so a reported node
+	// means the directory exists. The trap is set here and not in job.sh, which has
+	// its own.
 	if socketDir := socketDirFor(config.SocketDirRoot, podUID); socketDir != "" {
 		prefix += "\nINTERLINK_SOCKET_DIR=" + shellescape.Quote(socketDir) + "; export INTERLINK_SOCKET_DIR"
 		prefix += "\n(umask 077 && mkdir -p " + shellescape.Quote(config.SocketDirRoot) + `); rm -rf "$INTERLINK_SOCKET_DIR" 2>/dev/null`
@@ -1899,12 +1905,12 @@ func removeJID(podUID string, JIDs *map[string]*JidStruct) {
 // normally). For a gang, N members share one JID, so the count decreases as
 // each member is deleted; scancel is deferred until only the last remains.
 // An empty jid returns 0 (never scancel an empty ID).
-func countJIDReferences(JIDs *map[string]*JidStruct, jid string) int {
+func countJIDReferences(jids *map[string]*JidStruct, jid string) int {
 	if jid == "" {
 		return 0
 	}
 	n := 0
-	for _, entry := range *JIDs {
+	for _, entry := range *jids {
 		if entry != nil && entry.JID == jid {
 			n++
 		}
@@ -1928,31 +1934,31 @@ func countJIDReferences(JIDs *map[string]*JidStruct, jid string) int {
 //
 // Returns the captured jid (empty if the pod had no JID entry) and an error if
 // scancel failed.
-func scancelDecideAndRemoveJID(Ctx context.Context, config SlurmConfig, podUID string, JIDs *map[string]*JidStruct) (string, error) {
+func scancelDecideAndRemoveJID(ctx context.Context, config SlurmConfig, podUID string, jids *map[string]*JidStruct) (string, error) {
 	// Not every pod that reaches here has a job: sbatch may have been rejected, or
-	// the plugin may have restarted since submission. Both leave no JIDs entry, and
+	// the plugin may have restarted since submission. Both leave no jids entry, and
 	// dereferencing the nil *JidStruct panics the whole request handler.
 	jid := ""
-	if entry := (*JIDs)[podUID]; entry != nil {
+	if entry := (*jids)[podUID]; entry != nil {
 		jid = entry.JID
-		if countJIDReferences(JIDs, jid) <= 1 {
-			if _, err := exec.Command(config.Scancelpath, jid).Output(); err != nil {
-				log.G(Ctx).Error(err)
+		if countJIDReferences(jids, jid) <= 1 {
+			if _, err := exec.Command(config.Scancelpath, jid).Output(); err != nil { //nolint:gosec // scancel from the site config, jid is the numeric job ID
+				log.G(ctx).Error(err)
 				return jid, err
 			}
-			log.G(Ctx).Info("- Deleted Job ", jid)
+			log.G(ctx).Info("- Deleted Job ", jid)
 		} else {
-			log.G(Ctx).Infof("- Skipping scancel of shared gang Job %s: other pods still reference it", jid)
+			log.G(ctx).Infof("- Skipping scancel of shared gang Job %s: other pods still reference it", jid)
 		}
 	}
-	removeJID(podUID, JIDs)
+	removeJID(podUID, jids)
 	return jid, nil
 }
 
 // removeJobFilesWithRetry removes a pod's on-disk dir, retrying once after a
 // short sleep because logs may still be open in follow mode. This is the SLOW
 // part of a delete (it can sleep 5s) and MUST run without any lock held.
-func removeJobFilesWithRetry(Ctx context.Context, span trace.Span, podUID, jid, path string) error {
+func removeJobFilesWithRetry(ctx context.Context, span trace.Span, podUID, jid, path string) error {
 	errFirstAttempt := os.RemoveAll(path)
 	span.SetAttributes(
 		attribute.String("delete.pod.uid", podUID),
@@ -1960,18 +1966,18 @@ func removeJobFilesWithRetry(Ctx context.Context, span trace.Span, podUID, jid, 
 	)
 
 	if errFirstAttempt != nil {
-		log.G(Ctx).Debug("Attempt 1 of deletion failed, not really an error! Probably log file still opened, waiting for close... Error: ", errFirstAttempt)
+		log.G(ctx).Debug("Attempt 1 of deletion failed, not really an error! Probably log file still opened, waiting for close... Error: ", errFirstAttempt)
 		// We expect first rm of directory to possibly fail, in case for eg logs are in follow mode, so opened. The removeJID will end the follow loop,
 		// maximum after the loop period of 4s. So we ignore the error and attempt a second time after being sure the loop has ended.
 		time.Sleep(5 * time.Second)
 
 		errSecondAttempt := os.RemoveAll(path)
 		if errSecondAttempt != nil {
-			log.G(Ctx).Error("Attempt 2 of deletion failed: ", errSecondAttempt)
+			log.G(ctx).Error("Attempt 2 of deletion failed: ", errSecondAttempt)
 			span.AddEvent("Failed to delete SLURM Job " + jid + " for Pod " + podUID)
 			return errSecondAttempt
 		}
-		log.G(Ctx).Info("Attempt 2 of deletion succeeded!")
+		log.G(ctx).Info("Attempt 2 of deletion succeeded!")
 	}
 	span.AddEvent("SLURM Job " + jid + " for Pod " + podUID + " successfully deleted")
 
@@ -1989,14 +1995,14 @@ func removeJobFilesWithRetry(Ctx context.Context, span trace.Span, podUID, jid, 
 // Delete handler instead calls the two halves separately (scancelDecideAndRemoveJID
 // under h.GangMu, then removeJobFilesWithRetry unlocked) so the 5s retry sleep
 // never stalls concurrent gang operations.
-func deleteContainer(Ctx context.Context, config SlurmConfig, podUID string, JIDs *map[string]*JidStruct, path string) error {
-	log.G(Ctx).Info("- Deleting Job for pod " + podUID)
-	span := trace.SpanFromContext(Ctx)
-	jid, err := scancelDecideAndRemoveJID(Ctx, config, podUID, JIDs)
+func deleteContainer(ctx context.Context, config SlurmConfig, podUID string, jids *map[string]*JidStruct, path string) error {
+	log.G(ctx).Info("- Deleting Job for pod " + podUID)
+	span := trace.SpanFromContext(ctx)
+	jid, err := scancelDecideAndRemoveJID(ctx, config, podUID, jids)
 	if err != nil {
 		return err
 	}
-	return removeJobFilesWithRetry(Ctx, span, podUID, jid, path)
+	return removeJobFilesWithRetry(ctx, span, podUID, jid, path)
 }
 
 // For simple volume type like configMap, secret, projectedVolumeMap.
@@ -2236,8 +2242,22 @@ func checkIfJidExists(ctx context.Context, JIDs *map[string]*JidStruct, uid stri
 	}
 }
 
+// failedJobExitCode gives the exit code to report for a container whose status
+// file is missing when the job ended in a failure state, where Slurm's own exit
+// code can still read 0. OOM gets 137, as an OOM-killed container in Kubernetes.
+func failedJobExitCode(state string) (int32, bool) {
+	switch state {
+	case slurmStateOOM:
+		return 137, true
+	case "F", "TO", "PR":
+		return 1, true
+	default:
+		return 0, false
+	}
+}
+
 // getExitCode returns the exit code read from the .status file of a specific container and returns it as an int32 number
-func getExitCode(ctx context.Context, path string, ctName string, exitCodeMatch string, sessionContextMessage string) (int32, error) {
+func getExitCode(ctx context.Context, path string, ctName string, exitCodeMatch string, state string, sessionContextMessage string) (int32, error) {
 	statusFilePath := path + "/run-" + ctName + ".status"
 	exitCode, err := os.ReadFile(statusFilePath)
 	if err != nil {
@@ -2254,7 +2274,12 @@ func getExitCode(ctx context.Context, path string, ctName string, exitCodeMatch 
 					log.G(ctx).Error(errWithContext)
 					return 11, errWithContext
 				}
-				errWriteFile := os.WriteFile(statusFilePath, []byte(exitCodeMatch), 0644)
+				// A job that ended in a failure state never succeeded, whatever its exit code says.
+				if code, failed := failedJobExitCode(state); failed && exitCodeInt == 0 {
+					log.G(ctx).Warning(sessionContextMessage, "job state ", state, " with exit code 0: reporting ", code)
+					exitCodeInt = int(code)
+				}
+				errWriteFile := os.WriteFile(statusFilePath, []byte(strconv.Itoa(exitCodeInt)), 0o600)
 				if errWriteFile != nil {
 					errWithContext := fmt.Errorf(sessionContextMessage+"error during WriteFile() of getExitCode() of file %s error: %s %w", statusFilePath, fmt.Sprintf("%#v", errWriteFile), errWriteFile)
 					log.G(ctx).Error(errWithContext)
@@ -2302,6 +2327,11 @@ func prepareRuntimeCommand(config SlurmConfig, container v1.Container, metadata 
 		// no-eval is important so that singularity does not evaluate env var, because the shellquote has already done the safety check.
 		commstr1 := []string{config.SingularityPath, singularityCommand}
 		commstr1 = append(commstr1, config.SingularityDefaultOptions...)
+		// Kubernetes starts the container in its workingDir; singularity starts it in the
+		// job's directory unless told otherwise.
+		if container.WorkingDir != "" {
+			commstr1 = append(commstr1, "--pwd", shellescape.Quote(container.WorkingDir))
+		}
 		commstr1 = append(commstr1, singularityMounts, singularityOptions)
 		runtimeCommand = commstr1
 	case "enroot":

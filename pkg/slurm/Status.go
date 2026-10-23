@@ -130,7 +130,8 @@ func (h *SidecarHandler) StatusHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if timeNow.Sub(timer) >= time.Second*10 {
+	cached, stale := cachedStatuses(req, timeNow)
+	if len(stale) > 0 {
 		cmd := []string{"--me"}
 		shell := exec.ExecTask{
 			Command: h.Config.Squeuepath,
@@ -146,8 +147,8 @@ func (h *SidecarHandler) StatusHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		podDirs := make(map[string]string, len(req))
-		for _, pod := range req {
+		podDirs := make(map[string]string, len(stale))
+		for _, pod := range stale {
 			containerStatuses := []v1.ContainerStatus{}
 			uid := string(pod.UID)
 			// Resolve the job working directory: prefer in-memory cache, then
@@ -250,7 +251,7 @@ func (h *SidecarHandler) StatusHandler(w http.ResponseWriter, r *http.Request) {
 							f.WriteString((*h.JIDs)[uid].EndTime.Format("2006-01-02 15:04:05.999999999 -0700 MST"))
 						}
 						for _, ct := range pod.Spec.Containers {
-							exitCode, err := getExitCode(h.Ctx, path, ct.Name, exitCodeMatch, sessionContextMessage)
+							exitCode, err := getExitCode(h.Ctx, path, ct.Name, exitCodeMatch, stateMatch, sessionContextMessage)
 							if err != nil {
 								log.G(h.Ctx).Error(err)
 								continue
@@ -322,7 +323,7 @@ func (h *SidecarHandler) StatusHandler(w http.ResponseWriter, r *http.Request) {
 							f.WriteString((*h.JIDs)[uid].EndTime.Format("2006-01-02 15:04:05.999999999 -0700 MST"))
 						}
 						for _, ct := range pod.Spec.Containers {
-							exitCode, err := getExitCode(h.Ctx, path, ct.Name, exitCodeMatch, sessionContextMessage)
+							exitCode, err := getExitCode(h.Ctx, path, ct.Name, exitCodeMatch, stateMatch, sessionContextMessage)
 							if err != nil {
 								log.G(h.Ctx).Error(err)
 								continue
@@ -349,7 +350,7 @@ func (h *SidecarHandler) StatusHandler(w http.ResponseWriter, r *http.Request) {
 							f.WriteString((*h.JIDs)[uid].EndTime.Format("2006-01-02 15:04:05.999999999 -0700 MST"))
 						}
 						for _, ct := range pod.Spec.Containers {
-							exitCode, err := getExitCode(h.Ctx, path, ct.Name, exitCodeMatch, sessionContextMessage)
+							exitCode, err := getExitCode(h.Ctx, path, ct.Name, exitCodeMatch, stateMatch, sessionContextMessage)
 							if err != nil {
 								log.G(h.Ctx).Error(err)
 								continue
@@ -442,7 +443,7 @@ func (h *SidecarHandler) StatusHandler(w http.ResponseWriter, r *http.Request) {
 							f.WriteString((*h.JIDs)[uid].EndTime.Format("2006-01-02 15:04:05.999999999 -0700 MST"))
 						}
 						for _, ct := range pod.Spec.Containers {
-							exitCode, err := getExitCode(h.Ctx, path, ct.Name, exitCodeMatch, sessionContextMessage)
+							exitCode, err := getExitCode(h.Ctx, path, ct.Name, exitCodeMatch, stateMatch, sessionContextMessage)
 							if err != nil {
 								log.G(h.Ctx).Error(err)
 								continue
@@ -467,7 +468,7 @@ func (h *SidecarHandler) StatusHandler(w http.ResponseWriter, r *http.Request) {
 						log.G(h.Ctx).Infof("%sSLURM job %s reached time limit (pod %s/%s); reporting containers as terminated",
 							sessionContextMessage, (*h.JIDs)[uid].JID, pod.Namespace, pod.Name)
 						for _, ct := range pod.Spec.Containers {
-							exitCode, err := getExitCode(h.Ctx, path, ct.Name, exitCodeMatch, sessionContextMessage)
+							exitCode, err := getExitCode(h.Ctx, path, ct.Name, exitCodeMatch, stateMatch, sessionContextMessage)
 							if err != nil {
 								log.G(h.Ctx).Error(err)
 								continue
@@ -488,7 +489,7 @@ func (h *SidecarHandler) StatusHandler(w http.ResponseWriter, r *http.Request) {
 							}
 						}
 						for _, ct := range pod.Spec.Containers {
-							exitCode, err := getExitCode(h.Ctx, path, ct.Name, exitCodeMatch, sessionContextMessage)
+							exitCode, err := getExitCode(h.Ctx, path, ct.Name, exitCodeMatch, stateMatch, sessionContextMessage)
 							if err != nil {
 								log.G(h.Ctx).Error(err)
 								continue
@@ -509,7 +510,7 @@ func (h *SidecarHandler) StatusHandler(w http.ResponseWriter, r *http.Request) {
 							f.WriteString((*h.JIDs)[uid].EndTime.Format("2006-01-02 15:04:05.999999999 -0700 MST"))
 						}
 						for _, ct := range pod.Spec.Containers {
-							exitCode, err := getExitCode(h.Ctx, path, ct.Name, exitCodeMatch, sessionContextMessage)
+							exitCode, err := getExitCode(h.Ctx, path, ct.Name, exitCodeMatch, stateMatch, sessionContextMessage)
 							if err != nil {
 								log.G(h.Ctx).Error(err)
 								continue
@@ -546,12 +547,9 @@ func (h *SidecarHandler) StatusHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		cachedStatus = resp
-		timer = time.Now()
-	} else {
-		log.G(h.Ctx).Debug(sessionContextMessage, "Cached status")
-		resp = cachedStatus
+		storeStatuses(resp, time.Now())
 	}
+	resp = inRequestOrder(req, cached, resp)
 
 	log.G(h.Ctx).Debug(resp)
 

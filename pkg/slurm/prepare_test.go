@@ -1366,3 +1366,18 @@ func TestProduceSLURMScriptSinglePodGolden(t *testing.T) {
 		}
 	}
 }
+
+// TestPrepareRuntimeCommandWorkingDir: Kubernetes starts a container in its workingDir;
+// an image whose entrypoint is relative (Katib's metrics collector: ./file-metricscollector
+// in /app) fails with "not found" if singularity starts it elsewhere.
+func TestPrepareRuntimeCommandWorkingDir(t *testing.T) {
+	config := SlurmConfig{ContainerRuntime: "singularity", SingularityPath: "singularity"}
+	got := strings.Join(prepareRuntimeCommand(config, v1.Container{Name: "c", WorkingDir: "/app"}, metav1.ObjectMeta{}), " ")
+	if !strings.Contains(got, "--pwd /app") {
+		t.Errorf("runtime command %q: want --pwd /app", got)
+	}
+	got = strings.Join(prepareRuntimeCommand(config, v1.Container{Name: "c"}, metav1.ObjectMeta{}), " ")
+	if strings.Contains(got, "--pwd") {
+		t.Errorf("runtime command %q: no --pwd without workingDir", got)
+	}
+}

@@ -120,17 +120,24 @@ type SlurmConfig struct {
 	// BUFFERED in the plugin and submitted together as a single co-scheduled
 	// `sbatch --nodes=N` job. Pods WITHOUT that annotation always take the
 	// unchanged single-pod path, regardless of this flag.
-	GangSchedulingEnabled bool   `yaml:"GangSchedulingEnabled"` // default false
+	GangSchedulingEnabled bool `yaml:"GangSchedulingEnabled"` // default false
 	// GangTimeout is how long an incomplete gang is buffered before being
 	// abandoned (its buffered members' dirs removed and the entry dropped).
 	// Parsed as a Go duration string (e.g. "10m", "30s"). Empty => 10m.
 	GangTimeout string `yaml:"GangTimeout"`
-	// LauncherRegistryPath is the directory (a mounted ConfigMap) holding the
-	// injected launcher definitions (`<name>.sh`), selected per pod by the
-	// interlink.eu/launcher annotation. Read FRESH at gang-submit time so a
-	// ConfigMap edit hot-reloads without a plugin restart. Empty => the default
-	// /etc/interlink/launchers. See interlink-vk/in-cluster-bsc/gang/CLAUDE.md.
-	LauncherRegistryPath string `yaml:"LauncherRegistryPath"`
+	// SiteScriptPath is the site file (typically a mounted ConfigMap): its top level
+	// runs at the start of every gang job and its `<name>-launcher` functions start
+	// gangs whose pods carry interlink.eu/launcher: <name>. Read at each gang
+	// submission, so an edit applies to the next job. Empty => /etc/interlink/site/site.sh.
+	SiteScriptPath string `yaml:"SiteScriptPath"`
+	// GPUFlag is how this site's Slurm takes the GPUs a pod requests
+	// (nvidia.com/gpu, amd.com/gpu): "gres" (--gres=gpu:N, the default),
+	// "gpus-per-node" (--gpus-per-node=N) or "gpus" (--gpus=N).
+	GPUFlag string `yaml:"GPUFlag"`
+	// SiteTimeZone is the IANA time zone Slurm prints its times in (e.g.
+	// "Europe/Madrid"), used to read `sbatch --test-only` estimates. Empty => the
+	// plugin's own time zone.
+	SiteTimeZone string `yaml:"SiteTimeZone"`
 }
 
 type CreateStruct struct {
@@ -168,23 +175,9 @@ const (
 	GangRoleHead   = "head"
 	GangRoleWorker = "worker"
 
-	// GangModeAnnotation selects how the gang is launched inside the one
-	// co-scheduled sbatch. Absent/empty is the DEFAULT per-rank mode: one
-	// `srun --overlap --nodes=1 --ntasks=1` per member, each a self-contained
-	// process that finds peers via the injected MASTER_ADDR/RANK/WORLD_SIZE env
-	// (the correct model for Ray and torch-distributed). Value "mpi" selects the
-	// classic-MPI mode: ONE collective launcher srun spans the whole allocation
-	// (one MPI rank per node) and non-head members render no srun.
-	GangModeAnnotation = "interlink.eu/gang-mode"
-	// GangModeMPI is the GangModeAnnotation value that selects classic-MPI mode.
-	GangModeMPI = "mpi"
-
-	// LauncherAnnotation selects an injected launcher (by name) from the registry
-	// ConfigMap (SlurmConfig.LauncherRegistryPath). It SUPERSEDES GangModeAnnotation:
-	// the per-rank-vs-collective topology is a property declared inside the launcher
-	// file, not a separate annotation. Precedence: LauncherAnnotation wins; else the
-	// deprecated GangModeAnnotation=mpi alias; else the built-in default per-rank path.
-	// See interlink-vk/in-cluster-bsc/gang/CLAUDE.md.
+	// LauncherAnnotation names the site launcher that starts the gang: the
+	// `<name>-launcher` function of the site file (SlurmConfig.SiteScriptPath).
+	// Without it, each pod runs its own command on its own node.
 	LauncherAnnotation = "interlink.eu/launcher"
 )
 
@@ -202,7 +195,7 @@ type BufferedMember struct {
 	RuntimeCommands []ContainerCommand // this member's own rendered container commands
 	ResourceLimits  ResourceLimits
 	IsDefaultCPU    bool
-	IsDefaultRam    bool
+	IsDefaultRAM    bool
 	Flavor          *FlavorResolution
 }
 
@@ -266,7 +259,7 @@ type LifecycleHTTPGetSpec struct {
 // in a runtime-agnostic form.
 type LifecycleHookSpec struct {
 	Type        LifecycleHookType
-	ExecCommand []string           // populated when Type == LifecycleHookTypeExec
+	ExecCommand []string              // populated when Type == LifecycleHookTypeExec
 	HTTPGet     *LifecycleHTTPGetSpec // populated when Type == LifecycleHookTypeHTTPGet
 }
 
@@ -355,3 +348,10 @@ type slurmJSONNode struct {
 	FreeMemory  int64 `json:"free_memory"`  // MB
 	AllocMemory int64 `json:"alloc_memory"` // MB
 }
+
+// SlurmConfig.GPUFlag values.
+const (
+	GPUFlagGres        = "gres"
+	GPUFlagGPUsPerNode = "gpus-per-node"
+	GPUFlagGPUs        = "gpus"
+)

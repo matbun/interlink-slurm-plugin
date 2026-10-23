@@ -146,9 +146,9 @@ func assignRanks(members map[string]*BufferedMember) []*BufferedMember {
 		if assigned[m.PodUID] {
 			continue
 		}
-		raw, ok := m.Pod.ObjectMeta.Annotations[GangRankAnnotation]
+		raw, ok := m.Pod.Annotations[GangRankAnnotation]
 		if !ok {
-			raw, ok = m.Pod.ObjectMeta.Labels[JobCompletionIndexLabel]
+			raw, ok = m.Pod.Labels[JobCompletionIndexLabel]
 		}
 		if ok {
 			if r, err := strconv.Atoi(strings.TrimSpace(raw)); err == nil && r >= 0 && r < size && !taken[r] {
@@ -212,7 +212,7 @@ func assignRanks(members map[string]*BufferedMember) []*BufferedMember {
 // ceiling is expected and by design — only per-rank workload exit codes are
 // isolated (via each member's own run-<ctn>.status file).
 func produceGangSLURMScript(
-	Ctx context.Context,
+	ctx context.Context,
 	config SlurmConfig,
 	entry *GangEntry,
 	ordered []*BufferedMember,
@@ -225,7 +225,7 @@ func produceGangSLURMScript(
 	n := len(ordered)
 
 	if err := os.MkdirAll(headPath, os.ModePerm); err != nil {
-		log.G(Ctx).Error(err)
+		log.G(ctx).Error(err)
 		return "", err
 	}
 
@@ -235,28 +235,32 @@ func produceGangSLURMScript(
 	// gang-specific and prepended explicitly. Deduplication in buildSbatchFlags
 	// runs on the flavor/annotation set; our fixed --nodes/--ntasks-per-node are
 	// added after and are not user-overridable here.
-	flags := buildSbatchFlags(Ctx, config, head.Pod, head.Pod.ObjectMeta, head.RuntimeCommands,
-		head.ResourceLimits, head.IsDefaultCPU, head.IsDefaultRam, head.Flavor, true /*suppressDefaultMem*/)
+	flags := buildSbatchFlags(ctx, config, head.Pod, head.Pod.ObjectMeta, head.RuntimeCommands,
+		head.ResourceLimits, head.IsDefaultCPU, head.IsDefaultRAM, head.Flavor, true /*suppressDefaultMem*/)
 
 	// --- launcher selection (injected-launcher path) --------------------------
-	// interlink.eu/launcher picks a launcher file from the registry ConfigMap; its
-	// declared topology (per-rank | collective) replaces the old gang-mode branch.
-	// Loaded + validated FRESH here (crash-no-fallback: a bad launcher fails the
-	// whole submit rather than silently reverting to a built-in default).
+	// interlink.eu/launcher names a function of the site file (`<name>-launcher`),
+	// which starts the whole gang. Checked here: a launcher that cannot run fails
+	// the submission instead of falling back to another way of starting the job.
 	gpusPerNode := gpusPerNodeFromFlags(flags)
-	launcherName := selectedLauncherName(head.Pod.ObjectMeta)
-	var launcher *launcherDef
-	if launcherName != "" {
-		ld, lerr := loadLauncher(Ctx, config, launcherName)
-		if lerr != nil {
-			return "", fmt.Errorf("gang %s: %w", entry.Name, lerr)
-		}
-		launcher = ld
+	site, hasSite, serr := loadSite(ctx, config)
+	if serr != nil {
+		return "", fmt.Errorf("gang %s: %w", entry.Name, serr)
 	}
-	// #SBATCH --ntasks-per-node: a collective launcher over GPUs wants one task per
-	// GPU (gang6: QUDA's Ntask = total GPUs); everything else is one task per node.
+	launcherName := selectedLauncherName(head.Pod.ObjectMeta)
+	if launcherName != "" {
+		if !hasSite {
+			return "", fmt.Errorf("gang %s: launcher %q requested but there is no site file at %s", entry.Name, launcherName, siteScriptPath(config))
+		}
+		if err := site.checkLauncher(launcherName); err != nil {
+			return "", fmt.Errorf("gang %s: %w", entry.Name, err)
+		}
+	}
+	// #SBATCH --ntasks-per-node: launchers the site marks with interlink-tasks-per-gpu
+	// (mpirun takes its slots from the allocation) get one task per GPU; everything
+	// else one task per node.
 	tasksPerNode := 1
-	if launcher != nil && launcher.Topology == LauncherTopologyCollective && gpusPerNode > 0 {
+	if launcherName != "" && site.TasksPerGPU[launcherName] && gpusPerNode > 0 {
 		tasksPerNode = gpusPerNode
 	}
 
@@ -304,6 +308,17 @@ func produceGangSLURMScript(
 		body.WriteString(config.Commandprefix + "\n\n")
 	}
 
+	// The site file's top level (modules, exports) runs in the batch shell of every
+	// gang; its <name>-launcher functions become callable.
+	if hasSite {
+		sitePath, werr := writeSiteFile(headPath, site)
+		if werr != nil {
+			return "", fmt.Errorf("gang %s: %w", entry.Name, werr)
+		}
+		body.WriteString("# --- site file (" + site.Path + ") ---\n")
+		body.WriteString("source " + shellescape.Quote(sitePath) + "\n\n")
+	}
+
 	// HPC-tuning hook (BOTH modes): the head pod's slurm-job.vk.io/mpi-env
 	// annotation ("K=V;K=V") is materialized as `export SINGULARITYENV_<K>=<V>`
 	// in the batch shell BEFORE the launch section. Singularity's SINGULARITYENV_
@@ -347,51 +362,43 @@ func produceGangSLURMScript(
 	body.WriteString(`echo "gang " ` + shellescape.Quote(entry.Name) + ` " head_node=$head_node head_ip=$head_ip world_size=` + strconv.Itoa(n) + `"` + "\n")
 	// Gang topology exported for injected launchers (launcher_main reads these).
 	body.WriteString("export GANG_NNODES=" + strconv.Itoa(n) + "\n")
+	body.WriteString("export GANG_NODES=\"${nodes[*]}\"\n")
+	body.WriteString("export GANG_HEAD_NODE=\"$head_node\"\n")
 	body.WriteString("export GANG_GPUS_PER_NODE=" + strconv.Itoa(gpusPerNode) + "\n\n")
 	emitGangSocketDirs(&body, config.SocketDirRoot, ordered)
 
 	// --- launch section --------------------------------------------------------
-	// Selection order (see gang CLAUDE.md):
-	//   1. interlink.eu/launcher present -> injected launcher; its declared topology
-	//      picks per-rank (emitLauncherPerRank) vs collective (emitLauncherCollective).
-	//   2. else interlink.eu/gang-mode=mpi (DEPRECATED alias) -> built-in collective MPI.
-	//   3. else (DEFAULT) -> built-in per-rank model (Ray / torch-distributed): one
-	//      `srun --overlap --nodes=1 --ntasks=1` per member + readiness barrier +
-	//      DRIVER_RC = rank-0's rc.
-	switch {
-	case launcher != nil:
-		launcherPath, werr := writeLauncherFile(headPath, launcher)
-		if werr != nil {
-			return "", fmt.Errorf("gang %s: %w", entry.Name, werr)
+	//   - interlink.eu/launcher: the site's <name>-launcher starts every rank;
+	//   - otherwise each pod runs its own command on its own node (one
+	//     `srun --overlap --nodes=1 --ntasks=1` per member, head first).
+	if launcherName != "" {
+		// Probes check the pod's own command, which a site launcher replaces: drop
+		// their metadata so the status reports the containers ready while they run.
+		for _, m := range ordered {
+			for _, rc := range m.RuntimeCommands {
+				_ = os.Remove(fmt.Sprintf("%s/probe-metadata-%s.txt", m.FilesPath, rc.containerName))
+			}
 		}
-		if launcher.Topology == LauncherTopologyCollective {
-			emitLauncherCollective(&body, ordered, launcher, launcherPath, config.SocketDirRoot)
-		} else {
-			emitLauncherPerRank(&body, ordered, launcher, launcherPath, n, port, config.SocketDirRoot)
-		}
-	case strings.EqualFold(strings.TrimSpace(head.Pod.ObjectMeta.Annotations[GangModeAnnotation]), GangModeMPI):
-		log.G(Ctx).Warningf("gang %s: interlink.eu/gang-mode=mpi is DEPRECATED; migrate to interlink.eu/launcher (e.g. mpi-openmpi). Using the built-in collective-MPI shape.", entry.Name)
-		emitGangMPILauncher(&body, head, n)
-	default:
+		emitSiteLauncher(&body, ordered, launcherName, config.SocketDirRoot)
+	} else {
 		emitGangPerRankLaunch(&body, ordered, n, port)
 	}
 
 	// --- write job.slurm -------------------------------------------------------
 	scriptPath := headPath + "/job.slurm"
 	full := hdr.String() + "\n" + body.String()
-	if err := os.WriteFile(scriptPath, []byte(full), 0o774); err != nil {
-		log.G(Ctx).Error("Unable to write gang job.slurm ", scriptPath, ": ", err)
+	if err := os.WriteFile(scriptPath, []byte(full), 0o600); err != nil {
+		log.G(ctx).Error("Unable to write gang job.slurm ", scriptPath, ": ", err)
 		return "", err
 	}
-	log.G(Ctx).Infof("Rendered gang sbatch for '%s' (%d nodes) at %s", entry.Name, n, scriptPath)
+	log.G(ctx).Infof("Rendered gang sbatch for '%s' (%d nodes) at %s", entry.Name, n, scriptPath)
 	return scriptPath, nil
 }
 
 // emitGangPerRankLaunch renders the DEFAULT per-rank launch section (Ray/torch):
 // one `srun --overlap --nodes=1 --ntasks=1` per member, a readiness barrier
-// before the workers, and DRIVER_RC = rank-0's rc as the whole-gang result. This
-// is the original, unchanged behavior; the MPI path lives in
-// emitGangMPILauncher.
+// before the workers, and DRIVER_RC = rank-0's rc as the whole-gang result. Used
+// when the pods name no site launcher.
 func emitGangPerRankLaunch(bodyPtr *strings.Builder, ordered []*BufferedMember, n, port int) {
 	body := bodyPtr
 	// Track background PIDs so we can wait/teardown.
@@ -477,180 +484,57 @@ func emitGangPerRankLaunch(bodyPtr *strings.Builder, ordered []*BufferedMember, 
 	body.WriteString("exit \"$DRIVER_RC\"\n")
 }
 
-// emitGangMPILauncher renders the classic-MPI launch section: ONE collective
-// srun spanning the whole allocation, one MPI rank per node. It is selected only
-// when the head pod carries interlink.eu/gang-mode=mpi. There is no per-rank
-// loop, no readiness barrier, and no DRIVER_RC bookkeeping - the single srun's rc
-// IS the whole-job rc (the batch shell exits with it because `srun` is the last
-// command and `set -uo pipefail` leaves ${?} unmasked). Non-head members render
-// no srun at all; their pods still get the shared JID back-filled by stampJID for
-// Status / Delete.
+// emitSiteLauncher renders the launch section of a gang whose pods name a site
+// launcher: `<name>-launcher` runs ONCE from the batch script (on the head's node)
+// with the head pod's command as arguments and starts every rank itself. Its exit
+// code ends every pod.
 //
-// The container invocation is reconstructed EXACTLY as runCtn does (prepare.go):
-// strings.Join(rc.runtimeCommand, " ") (already includes the singularity exec
-// prefix, mounts, options and the SIF path as its last element) followed by each
-// rc.containerCommand and rc.containerArgs entry, shellescape-quoted.
-//
-// Launcher shape (default): `srun` is the launcher AND the PMIx server; each task
-// == one `singularity exec` == one MPI rank. `--ntasks-per-node=1` puts one rank
-// per node for the first milestone; PMIx does the wireup so no MASTER_ADDR is
-// needed. SRUN_CPUS_PER_TASK is exported because MN5's srun no longer propagates
-// cpus-per-task.
-//
-// TODO(nvhpc/mpirun alternative): the NVIDIA HPC SDK OpenMPI on MN5 ACC must be
-// launched with `mpirun` INSIDE a single-node srun (not `srun --mpi=pmix`), and
-// requires `export SLURM_CPU_BIND=none`. A future gang-mode value (e.g.
-// "mpi-mpirun") can select that second shape: `srun --nodes=1 --ntasks=1 -w
-// "$head_node" singularity exec $SIF mpirun -np $WORLD_SIZE <app>` with
-// SLURM_CPU_BIND=none exported. Left as a documented TODO to avoid overbuilding;
-// the pmix path is the clean HPC-native default.
-func emitGangMPILauncher(bodyPtr *strings.Builder, head *BufferedMember, n int) {
-	body := bodyPtr
-	headOut := head.FilesPath + "/job.out"
-	headErr := head.FilesPath + "/job.err"
-
-	// Reconstruct the container invocation from the head's first (non-init)
-	// runtime command, mirroring runCtn's assembly.
-	invocation := gangReconstructContainerInvocation(head.RuntimeCommands)
-
-	// Guard: a head with no non-init workload container would otherwise emit a
-	// bare `srun ... \` with an empty command. Can't happen on the normal path
-	// (the head always has a workload), but fail loudly rather than silently.
-	if strings.TrimSpace(invocation) == "" {
-		body.WriteString("echo 'gang MPI mode: head has no workload container to launch' >&2\n")
-		body.WriteString("exit 1\n")
-		return
-	}
-
-	body.WriteString("# --- classic-MPI launcher (interlink.eu/gang-mode=mpi): ONE srun over the whole allocation ---\n")
-	body.WriteString("# One srun task per node == one MPI rank; PMIx does the rendezvous (no MASTER_ADDR needed).\n")
-	// MN5: srun no longer propagates cpus-per-task; forward it explicitly.
-	body.WriteString(`export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK}"` + "\n")
-	body.WriteString("# Record the head compute node for shadow/tunnel discovery (best-effort).\n")
-	body.WriteString("hostname -f > " + shellescape.Quote(head.FilesPath+"/compute-node") + " || true\n")
-	body.WriteString(`srun --mpi="${SLURM_MPI_TYPE:-pmix}" --nodes="$WORLD_SIZE" --ntasks="$WORLD_SIZE" --ntasks-per-node=1 \` + "\n")
-	body.WriteString("     -o " + shellescape.Quote(headOut) + " -e " + shellescape.Quote(headErr) + " --open-mode=truncate \\\n")
-	body.WriteString("  " + invocation + "\n")
-}
-
-// emitLauncherCollective renders the COLLECTIVE injected-launcher section:
-// launcher_main runs ONCE from the batch script (on node[0]) and itself fans out
-// over the whole allocation (classic MPI openmpi/mpich, or the Ray cluster
-// bootstrap). It mirrors emitGangMPILauncher's contract (the single launch's rc is
-// the job rc; non-head members render no srun) but the launch SHAPE comes from the
-// injected launcher_main instead of a hardcoded srun. The head's container-exec
-// prefix is exported as GANG_CONTAINER and its app argv passed to launcher_main.
-func emitLauncherCollective(bodyPtr *strings.Builder, ordered []*BufferedMember, def *launcherDef, launcherPath, socketRoot string) {
-	body := bodyPtr
+// Logs: rank i writes to $GANG_LOG_DIR/rank-<i>.out (srun --output=...rank-%n.out),
+// which is pod i's log file; whatever the function prints itself goes to rank 0.
+func emitSiteLauncher(body *strings.Builder, ordered []*BufferedMember, name, socketRoot string) {
 	head := ordered[0]
 	prefix, appArgs, _, ok := launcherWorkload(head.RuntimeCommands)
 	if !ok {
-		body.WriteString("echo 'gang launcher (collective): head has no workload container to launch' >&2\n")
+		body.WriteString("echo 'gang launcher: the head pod has no workload container to launch' >&2\n")
 		body.WriteString("exit 1\n")
 		return
 	}
-	body.WriteString("# --- injected launcher '" + def.Name + "' (collective): launcher_main runs ONCE over the allocation ---\n")
-	// MN5: srun no longer propagates cpus-per-task; forward it explicitly.
-	body.WriteString(`export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK}"` + "\n")
-	// GANG_CONTAINER = the singularity/enroot exec prefix (opts + SIF); the launcher
-	// composes it with the app, e.g. `srun ... $GANG_CONTAINER "$@"` or
-	// `mpirun ... $GANG_CONTAINER "$@"`. Used unquoted so it word-splits into argv.
+	body.WriteString("# --- site launcher '" + name + "': " + name + launcherFuncSuffix + " starts every rank ---\n")
+	// srun no longer propagates cpus-per-task to steps; forward it explicitly.
+	body.WriteString(`export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-}"` + "\n")
+	// GANG_CONTAINER = the container-exec prefix (runtime options + image) of the head
+	// pod; launchers use it unquoted, e.g. `srun ... $GANG_CONTAINER "$@"`.
 	body.WriteString("export GANG_CONTAINER=" + shellescape.Quote(prefix) + "\n")
-	body.WriteString("# Record the head compute node for shadow/tunnel discovery (best-effort).\n")
 	body.WriteString("hostname -f > " + shellescape.Quote(head.FilesPath+"/compute-node") + " || true\n")
 	if socketDir := socketDirFor(socketRoot, head.PodUID); socketDir != "" {
 		body.WriteString("export INTERLINK_SOCKET_DIR=" + shellescape.Quote(socketDir) + "\n")
 	}
-	body.WriteString("source " + shellescape.Quote(launcherPath) + "\n")
+
+	logDir := head.FilesPath + "/ranks"
+	body.WriteString("export GANG_LOG_DIR=" + shellescape.Quote(logDir) + "\n")
+	body.WriteString(`mkdir -p "$GANG_LOG_DIR"` + "\n")
+	for _, m := range ordered {
+		_, _, ctnName, ok := launcherWorkload(m.RuntimeCommands)
+		if !ok {
+			continue
+		}
+		rankLog := logDir + "/rank-" + strconv.Itoa(m.Rank) + ".out"
+		body.WriteString(": > " + shellescape.Quote(rankLog) + "\n")
+		body.WriteString("ln -sfn " + shellescape.Quote(rankLog) + " " + shellescape.Quote(m.FilesPath+"/run-"+ctnName+".out") + "\n")
+	}
+
 	// A subshell: a launcher may end in exec, which must not replace the batch shell
 	// before the status files below are written.
-	body.WriteString("( launcher_main " + shellescapeArgs(appArgs) + " )\n")
+	body.WriteString("( " + name + launcherFuncSuffix + " " + shellescapeArgs(appArgs) + " ) >>" +
+		shellescape.Quote(logDir+"/rank-0.out") + " 2>&1\n")
 	body.WriteString("LAUNCHER_RC=$?\n")
-	body.WriteString("echo \"gang launcher '" + def.Name + "' exited rc=$LAUNCHER_RC\"\n")
-	// A collective run is one program: every member ends with its rc.
+	body.WriteString("echo \"gang launcher '" + name + "' exited rc=$LAUNCHER_RC\"\n")
 	for _, m := range ordered {
 		if _, _, ctnName, ok := launcherWorkload(m.RuntimeCommands); ok {
 			body.WriteString("echo \"$LAUNCHER_RC\" > " + shellescape.Quote(m.FilesPath+"/run-"+ctnName+".status") + " || true\n")
 		}
 	}
 	body.WriteString("exit \"$LAUNCHER_RC\"\n")
-}
-
-// emitLauncherPerRank renders the PER-RANK injected-launcher section: like
-// emitGangPerRankLaunch (one `srun --overlap` per member, readiness barrier,
-// DRIVER_RC = rank-0's rc), but each rank runs `source launcher.sh; launcher_main
-// <app>` instead of the member's job.sh. Per-pod logs come from the srun -o/-e;
-// per-pod status is written as run-<container>.status from launcher_main's rc so
-// Status.go's gang branch still diverges per pod. GANG_NNODES/GANG_GPUS_PER_NODE and
-// RANK/WORLD_SIZE/MASTER_* reach each rank via `srun --export` from the batch shell.
-// NOTE: this path targets single-workload-container pods (the norm for distributed
-// jobs); init containers / probes / multi-container pods should use the default
-// (no-launcher) path, which runs the full job.sh.
-func emitLauncherPerRank(bodyPtr *strings.Builder, ordered []*BufferedMember, def *launcherDef, launcherPath string, n, port int, socketRoot string) {
-	body := bodyPtr
-	body.WriteString("declare -a RANK_PIDS=()\n\n")
-
-	emitRank := func(m *BufferedMember) {
-		node := "${nodes[" + strconv.Itoa(m.Rank) + "]}"
-		out := m.FilesPath + "/job.out"
-		errOut := m.FilesPath + "/job.err"
-		prefix, appArgs, ctnName, ok := launcherWorkload(m.RuntimeCommands)
-		if !ok {
-			body.WriteString("# rank " + strconv.Itoa(m.Rank) + " (" + m.Role + ") pod " + m.PodUID + ": no workload container; skipping\n\n")
-			return
-		}
-		statusFile := m.FilesPath + "/run-" + ctnName + ".status"
-		// Inner (fresh srun sub-shell): set THIS member's container prefix, record its
-		// compute node, source the launcher, run launcher_main with the app argv, and
-		// persist rc as this rank's per-pod status file.
-		socketExport := ""
-		if socketDir := socketDirFor(socketRoot, m.PodUID); socketDir != "" {
-			socketExport = "export INTERLINK_SOCKET_DIR=" + shellescape.Quote(socketDir) + "\n"
-		}
-		// launcher_main runs in a subshell: launchers end in exec, which would otherwise
-		// skip writing this rank's status file.
-		inner := "export GANG_CONTAINER=" + shellescape.Quote(prefix) + "\n" +
-			socketExport +
-			"hostname -f > " + shellescape.Quote(m.FilesPath+"/compute-node") + " || true\n" +
-			"source " + shellescape.Quote(launcherPath) + "\n" +
-			"( launcher_main " + shellescapeArgs(appArgs) + " )\n" +
-			"RC=$?\n" +
-			"echo \"$RC\" > " + shellescape.Quote(statusFile) + " || true\n" +
-			"exit \"$RC\""
-		body.WriteString("# rank " + strconv.Itoa(m.Rank) + " (" + m.Role + ") pod " + m.PodUID + " via launcher '" + def.Name + "'\n")
-		body.WriteString("srun --overlap --nodes=1 --ntasks=1 -w \"" + node + "\" \\\n")
-		body.WriteString("     --export=ALL,RANK=" + strconv.Itoa(m.Rank) + ",WORLD_SIZE=" + strconv.Itoa(n) +
-			",MASTER_ADDR=\"$head_ip\",MASTER_PORT=" + strconv.Itoa(port) +
-			",RAY_ADDRESS=\"$head_ip:" + strconv.Itoa(port) + "\" \\\n")
-		body.WriteString("     -o " + shellescape.Quote(out) + " -e " + shellescape.Quote(errOut) + " --open-mode=truncate \\\n")
-		body.WriteString("  bash -c " + shellescape.Quote(inner) + " &\n")
-		body.WriteString("RANK_PIDS+=($!)\n\n")
-	}
-
-	// Head first, then a readiness barrier, then the workers (mirrors emitGangPerRankLaunch).
-	emitRank(ordered[0])
-	if n > 1 {
-		body.WriteString("# readiness barrier: wait for the head coordinator before launching workers\n")
-		body.WriteString("head_ready=0\n")
-		body.WriteString("for i in $(seq 1 60); do\n")
-		body.WriteString("  if srun --overlap --nodes=1 --ntasks=1 -w \"$head_node\" bash -c \"exec 3<>/dev/tcp/$head_ip/$MASTER_PORT\" >/dev/null 2>&1; then head_ready=1; break; fi\n")
-		body.WriteString("  sleep 2\n")
-		body.WriteString("done\n")
-		body.WriteString("echo \"gang head_ready=$head_ready\"\n\n")
-		for _, m := range ordered[1:] {
-			emitRank(m)
-		}
-	}
-
-	body.WriteString("# Wait for the head (rank 0 / driver) and capture its rc as the gang result.\n")
-	body.WriteString("DRIVER_RC=0\n")
-	body.WriteString("if [ \"${#RANK_PIDS[@]}\" -gt 0 ]; then\n")
-	body.WriteString("  wait \"${RANK_PIDS[0]}\"; DRIVER_RC=$?\n")
-	body.WriteString("fi\n")
-	body.WriteString("for pid in \"${RANK_PIDS[@]:1}\"; do kill \"$pid\" 2>/dev/null || true; done\n")
-	body.WriteString("wait 2>/dev/null || true\n")
-	body.WriteString("echo \"DRIVER_RC=$DRIVER_RC\"\n")
-	body.WriteString("exit \"$DRIVER_RC\"\n")
 }
 
 // emitGangSocketDirs creates every member's private socket directory (as a single
@@ -668,36 +552,6 @@ func emitGangSocketDirs(body *strings.Builder, root string, ordered []*BufferedM
 		body.WriteString("rm -rf " + d + "; (umask 077 && mkdir " + d + " && chmod 0700 " + d + ") || { echo \"interLink: cannot create a private socket directory\" >&2; exit 1; }\n")
 	}
 	body.WriteString("trap " + shellescape.Quote("rm -rf "+strings.Join(dirs, " ")) + " EXIT\n\n")
-}
-
-// gangReconstructContainerInvocation rebuilds the container command line the same
-// way runCtn does in prepare.go: join rc.runtimeCommand with spaces (it already
-// includes the singularity exec prefix + mounts/options + the SIF path as its
-// last element), then append each containerCommand and containerArgs entry
-// shellescape-quoted. It uses the FIRST non-init container command (the head's
-// workload). Returns an empty string if there is no usable runtime command.
-func gangReconstructContainerInvocation(rcs []ContainerCommand) string {
-	var rc *ContainerCommand
-	for i := range rcs {
-		if !rcs[i].isInitContainer {
-			rc = &rcs[i]
-			break
-		}
-	}
-	if rc == nil {
-		return ""
-	}
-	var b strings.Builder
-	b.WriteString(strings.Join(rc.runtimeCommand, " "))
-	for _, c := range rc.containerCommand {
-		b.WriteString(" ")
-		b.WriteString(shellescape.Quote(c))
-	}
-	for _, a := range rc.containerArgs {
-		b.WriteString(" ")
-		b.WriteString(shellescape.Quote(a))
-	}
-	return b.String()
 }
 
 // gangMPIEnvExports parses the head pod's slurm-job.vk.io/mpi-env annotation
@@ -786,24 +640,32 @@ func slurmJobGone(stdout, stderr string, exitCode int) bool {
 	switch strings.Fields(out)[0] {
 	// Unambiguously terminal squeue StateCompact codes. PR (preempted) is
 	// deliberately absent: a preempt-requeued job returns to PD.
-	case "CD", "CA", "F", "TO", "NF", "BF", "DL", "OOM", "SE":
+	case "CD", "CA", "F", "TO", "NF", "BF", "DL", slurmStateOOM, "SE":
 		return true
 	}
 	return false
 }
 
+// slurmStateOOM is squeue's compact state of a job killed for running out of memory.
+const slurmStateOOM = "OOM"
+
+// squeueNoHeader drops squeue's header line.
+const squeueNoHeader = "--noheader"
+
 // gangJobIsGone asks SLURM whether the submitted gang JID still exists, using
 // the same squeue invocation shape as Status.go. A failure to even run squeue
 // reports NOT gone (see slurmJobGone's asymmetry rationale).
-func gangJobIsGone(Ctx context.Context, config SlurmConfig, jid string) bool {
+func gangJobIsGone(ctx context.Context, config SlurmConfig, jid string) bool {
 	shell := exec.ExecTask{
 		Command: config.Squeuepath,
-		Args:    []string{"--noheader", "-a", "--states=all", "-O", "StateCompact", "-j ", jid},
-		Shell:   true,
+		// "-j", jid as two arguments: a shim that forwards arguments faithfully would
+		// otherwise pass squeue a blank job ID.
+		Args:  []string{squeueNoHeader, "-a", "--states=all", "-O", "StateCompact", "-j", jid},
+		Shell: true,
 	}
 	execReturn, err := shell.Execute()
 	if err != nil {
-		log.G(Ctx).Warning("Gang staleness probe: could not run squeue for JID "+jid+": ", err, " (treating as alive)")
+		log.G(ctx).Warning("Gang staleness probe: could not run squeue for JID "+jid+": ", err, " (treating as alive)")
 		return false
 	}
 	return slurmJobGone(execReturn.Stdout, execReturn.Stderr, execReturn.ExitCode)
@@ -856,24 +718,24 @@ func readMemberContainerExitCode(path, ctName string) (int32, bool, error) {
 // gang.marker (so this member is recognised as a gang member across restarts),
 // and registers the JID in the shared JIDs map with Gang=true. The caller MUST
 // hold h.GangMu.
-func stampJID(Ctx context.Context, JIDs *map[string]*JidStruct, uid, ns, jid, dir string) error {
-	if err := os.WriteFile(dir+"/JobID.jid", []byte(jid), 0o644); err != nil {
-		log.G(Ctx).Error("Can't write JobID.jid for ", uid, ": ", err)
+func stampJID(ctx context.Context, jids *map[string]*JidStruct, uid, ns, jid, dir string) error {
+	if err := os.WriteFile(dir+"/JobID.jid", []byte(jid), 0o600); err != nil {
+		log.G(ctx).Error("Can't write JobID.jid for ", uid, ": ", err)
 		return err
 	}
-	if err := os.WriteFile(dir+"/PodNamespace.ns", []byte(ns), 0o644); err != nil {
-		log.G(Ctx).Error("Can't write PodNamespace.ns for ", uid, ": ", err)
+	if err := os.WriteFile(dir+"/PodNamespace.ns", []byte(ns), 0o600); err != nil {
+		log.G(ctx).Error("Can't write PodNamespace.ns for ", uid, ": ", err)
 		return err
 	}
-	if err := os.WriteFile(dir+"/PodUID.uid", []byte(uid), 0o644); err != nil {
-		log.G(Ctx).Error("Can't write PodUID.uid for ", uid, ": ", err)
+	if err := os.WriteFile(dir+"/PodUID.uid", []byte(uid), 0o600); err != nil {
+		log.G(ctx).Error("Can't write PodUID.uid for ", uid, ": ", err)
 		return err
 	}
-	if err := os.WriteFile(dir+"/"+gangMarkerFile, []byte(jid), 0o644); err != nil {
-		log.G(Ctx).Error("Can't write gang.marker for ", uid, ": ", err)
+	if err := os.WriteFile(dir+"/"+gangMarkerFile, []byte(jid), 0o600); err != nil {
+		log.G(ctx).Error("Can't write gang.marker for ", uid, ": ", err)
 		return err
 	}
-	(*JIDs)[uid] = &JidStruct{PodUID: uid, PodNamespace: ns, JID: jid, Gang: true}
+	(*jids)[uid] = &JidStruct{PodUID: uid, PodNamespace: ns, JID: jid, Gang: true}
 	return nil
 }
 
@@ -886,14 +748,14 @@ func stampJID(Ctx context.Context, JIDs *map[string]*JidStruct, uid, ns, jid, di
 //     200 with PodJID=jid for THIS pod (siblings reconcile via Status re-poll).
 //
 // The whole critical section is under h.GangMu, which also guards the JIDs writes.
-func (h *SidecarHandler) bufferGangMember(Ctx context.Context, member *BufferedMember, size int) (string, bool, error) {
+func (h *SidecarHandler) bufferGangMember(ctx context.Context, member *BufferedMember, size int) (string, bool, error) {
 	gangName := gangNameFromMeta(member.Pod.ObjectMeta)
 
 	h.GangMu.Lock()
 	defer h.GangMu.Unlock()
 
 	// Opportunistically clear any timed-out incomplete gangs while we hold the lock.
-	h.sweepGangsLocked(Ctx)
+	h.sweepGangsLocked(ctx)
 
 	if h.GangTable == nil {
 		h.GangTable = make(map[string]*GangEntry)
@@ -907,7 +769,7 @@ func (h *SidecarHandler) bufferGangMember(Ctx context.Context, member *BufferedM
 			CreatedAt: time.Now(),
 		}
 		h.GangTable[gangName] = entry
-		log.G(Ctx).Infof("Gang '%s': created buffer, size=%d", gangName, size)
+		log.G(ctx).Infof("Gang '%s': created buffer, size=%d", gangName, size)
 	}
 
 	// Idempotency / re-Create safety: if this UID is already buffered, or the gang
@@ -918,10 +780,10 @@ func (h *SidecarHandler) bufferGangMember(Ctx context.Context, member *BufferedM
 		// belongs to THIS generation whatever state its job is in (Status.go owns
 		// the terminal reporting).
 		if _, known := entry.Members[member.PodUID]; known {
-			if err := stampJID(Ctx, h.JIDs, member.PodUID, member.Namespace, entry.JID, member.FilesPath); err != nil {
+			if err := stampJID(ctx, h.JIDs, member.PodUID, member.Namespace, entry.JID, member.FilesPath); err != nil {
 				return "", false, err
 			}
-			log.G(Ctx).Infof("Gang '%s': already submitted, returning shared JID %s for re-Created member %s", gangName, entry.JID, member.PodUID)
+			log.G(ctx).Infof("Gang '%s': already submitted, returning shared JID %s for re-Created member %s", gangName, entry.JID, member.PodUID)
 			return entry.JID, true, nil
 		}
 
@@ -940,15 +802,15 @@ func (h *SidecarHandler) bufferGangMember(Ctx context.Context, member *BufferedM
 		// path (never on first-generation Creates), which also serializes
 		// concurrent new-generation arrivals so exactly one of them rebuilds the
 		// entry.
-		if !gangJobIsGone(Ctx, h.Config, entry.JID) {
+		if !gangJobIsGone(ctx, h.Config, entry.JID) {
 			entry.Members[member.PodUID] = member
-			if err := stampJID(Ctx, h.JIDs, member.PodUID, member.Namespace, entry.JID, member.FilesPath); err != nil {
+			if err := stampJID(ctx, h.JIDs, member.PodUID, member.Namespace, entry.JID, member.FilesPath); err != nil {
 				return "", false, err
 			}
-			log.G(Ctx).Warningf("Gang '%s': new pod %s joined an already-submitted LIVE gang (JID %s); binding as replacement", gangName, member.PodUID, entry.JID)
+			log.G(ctx).Warningf("Gang '%s': new pod %s joined an already-submitted LIVE gang (JID %s); binding as replacement", gangName, member.PodUID, entry.JID)
 			return entry.JID, true, nil
 		}
-		log.G(Ctx).Warningf("Gang '%s': submitted JID %s is gone from SLURM; dropping the stale entry and starting a fresh generation with pod %s", gangName, entry.JID, member.PodUID)
+		log.G(ctx).Warningf("Gang '%s': submitted JID %s is gone from SLURM; dropping the stale entry and starting a fresh generation with pod %s", gangName, entry.JID, member.PodUID)
 		entry = &GangEntry{
 			Name:      gangName,
 			Size:      size,
@@ -960,15 +822,15 @@ func (h *SidecarHandler) bufferGangMember(Ctx context.Context, member *BufferedM
 	entry.Members[member.PodUID] = member
 
 	if len(entry.Members) < entry.Size {
-		log.G(Ctx).Infof("Gang '%s': buffered pod %s (%d/%d), waiting for quorum", gangName, member.PodUID, len(entry.Members), entry.Size)
+		log.G(ctx).Infof("Gang '%s': buffered pod %s (%d/%d), waiting for quorum", gangName, member.PodUID, len(entry.Members), entry.Size)
 		return "", false, nil
 	}
 
 	// Quorum reached: this is the last arrival. Submit ONE sbatch for the group.
-	log.G(Ctx).Infof("Gang '%s': quorum reached (%d/%d), submitting single co-scheduled sbatch", gangName, len(entry.Members), entry.Size)
+	log.G(ctx).Infof("Gang '%s': quorum reached (%d/%d), submitting single co-scheduled sbatch", gangName, len(entry.Members), entry.Size)
 
 	ordered := assignRanks(entry.Members)
-	scriptPath, err := produceGangSLURMScript(Ctx, h.Config, entry, ordered)
+	scriptPath, err := produceGangSLURMScript(ctx, h.Config, entry, ordered)
 	if err != nil {
 		// This member's create fails and its controller replaces it; the others stay
 		// buffered, so the replacement completes the quorum again instead of making
@@ -980,10 +842,10 @@ func (h *SidecarHandler) bufferGangMember(Ctx context.Context, member *BufferedM
 	out, err := SLURMBatchSubmit(h.Ctx, h.Config, scriptPath)
 	if err != nil {
 		delete(entry.Members, member.PodUID)
-		log.G(Ctx).Error("Gang '"+gangName+"': sbatch failed: ", err)
+		log.G(ctx).Error("Gang '"+gangName+"': sbatch failed: ", err)
 		return "", false, err
 	}
-	log.G(Ctx).Info(out)
+	log.G(ctx).Info(out)
 
 	jid, err := parseJIDFromSubmit(out)
 	if err != nil {
@@ -993,13 +855,13 @@ func (h *SidecarHandler) bufferGangMember(Ctx context.Context, member *BufferedM
 	// Back-fill every member: register the shared JID in JIDs and persist the
 	// per-pod bookkeeping files so LoadJIDs rehydrates all N on restart.
 	for _, m := range ordered {
-		if err := stampJID(Ctx, h.JIDs, m.PodUID, m.Namespace, jid, m.FilesPath); err != nil {
+		if err := stampJID(ctx, h.JIDs, m.PodUID, m.Namespace, jid, m.FilesPath); err != nil {
 			return "", false, err
 		}
 	}
 	entry.JID = jid
 	entry.Submitted = true
-	log.G(Ctx).Infof("Gang '%s': submitted as SLURM job %s (%d nodes)", gangName, jid, len(ordered))
+	log.G(ctx).Infof("Gang '%s': submitted as SLURM job %s (%d nodes)", gangName, jid, len(ordered))
 
 	return jid, true, nil
 }
@@ -1007,7 +869,7 @@ func (h *SidecarHandler) bufferGangMember(Ctx context.Context, member *BufferedM
 // removeGangMemberOnDelete drops a deleted pod's UID from its gang entry and
 // removes the entry once empty. Safe to call for non-gang pods (no-op if the UID
 // is not tracked). Takes h.GangMu.
-func (h *SidecarHandler) removeGangMemberOnDelete(Ctx context.Context, uid string) {
+func (h *SidecarHandler) removeGangMemberOnDelete(ctx context.Context, uid string) {
 	h.GangMu.Lock()
 	defer h.GangMu.Unlock()
 	if h.GangTable == nil {
@@ -1016,11 +878,11 @@ func (h *SidecarHandler) removeGangMemberOnDelete(Ctx context.Context, uid strin
 	for name, entry := range h.GangTable {
 		if _, ok := entry.Members[uid]; ok {
 			delete(entry.Members, uid)
-			log.G(Ctx).Infof("Gang '%s': removed member %s on delete (%d remaining)", name, uid, len(entry.Members))
+			log.G(ctx).Infof("Gang '%s': removed member %s on delete (%d remaining)", name, uid, len(entry.Members))
 		}
 		if len(entry.Members) == 0 {
 			delete(h.GangTable, name)
-			log.G(Ctx).Infof("Gang '%s': entry dropped (empty)", name)
+			log.G(ctx).Infof("Gang '%s': entry dropped (empty)", name)
 		}
 	}
 }
@@ -1028,7 +890,7 @@ func (h *SidecarHandler) removeGangMemberOnDelete(Ctx context.Context, uid strin
 // sweepGangsLocked abandons any incomplete gang whose buffering has exceeded the
 // configured timeout: it removes every buffered member's dir and drops the entry.
 // Caller MUST hold h.GangMu.
-func (h *SidecarHandler) sweepGangsLocked(Ctx context.Context) {
+func (h *SidecarHandler) sweepGangsLocked(ctx context.Context) {
 	if h.GangTable == nil {
 		return
 	}
@@ -1040,10 +902,10 @@ func (h *SidecarHandler) sweepGangsLocked(Ctx context.Context) {
 		if time.Since(entry.CreatedAt) <= timeout {
 			continue
 		}
-		log.G(Ctx).Warningf("Gang '%s' timed out %d/%d after %s; abandoning buffered members", name, len(entry.Members), entry.Size, timeout)
+		log.G(ctx).Warningf("Gang '%s' timed out %d/%d after %s; abandoning buffered members", name, len(entry.Members), entry.Size, timeout)
 		for _, m := range entry.Members {
 			if err := os.RemoveAll(m.FilesPath); err != nil {
-				log.G(Ctx).Debugf("Gang '%s': failed to remove %s: %v", name, m.FilesPath, err)
+				log.G(ctx).Debugf("Gang '%s': failed to remove %s: %v", name, m.FilesPath, err)
 			}
 		}
 		delete(h.GangTable, name)
@@ -1052,8 +914,8 @@ func (h *SidecarHandler) sweepGangsLocked(Ctx context.Context) {
 
 // StartGangSweeper launches a background goroutine that periodically abandons
 // timed-out incomplete gangs. Started from main.go only when gang scheduling is
-// enabled. It exits when Ctx is cancelled.
-func (h *SidecarHandler) StartGangSweeper(Ctx context.Context) {
+// enabled. It exits when ctx is cancelled.
+func (h *SidecarHandler) StartGangSweeper(ctx context.Context) {
 	timeout := gangGuaranteeTimeout(h.Config)
 	// Sweep a few times per timeout window; never faster than every 30s.
 	interval := timeout / 4
@@ -1063,15 +925,15 @@ func (h *SidecarHandler) StartGangSweeper(Ctx context.Context) {
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-		log.G(Ctx).Infof("Gang sweeper started (timeout=%s, interval=%s)", timeout, interval)
+		log.G(ctx).Infof("Gang sweeper started (timeout=%s, interval=%s)", timeout, interval)
 		for {
 			select {
-			case <-Ctx.Done():
-				log.G(Ctx).Info("Gang sweeper stopping")
+			case <-ctx.Done():
+				log.G(ctx).Info("Gang sweeper stopping")
 				return
 			case <-ticker.C:
 				h.GangMu.Lock()
-				h.sweepGangsLocked(Ctx)
+				h.sweepGangsLocked(ctx)
 				h.GangMu.Unlock()
 			}
 		}
@@ -1096,7 +958,7 @@ func gangMemberFromCreate(
 	runtimeCommands []ContainerCommand,
 	resourceLimits ResourceLimits,
 	isDefaultCPU bool,
-	isDefaultRam bool,
+	isDefaultRAM bool,
 	flavor *FlavorResolution,
 ) *BufferedMember {
 	return &BufferedMember{
@@ -1108,7 +970,7 @@ func gangMemberFromCreate(
 		RuntimeCommands: runtimeCommands,
 		ResourceLimits:  resourceLimits,
 		IsDefaultCPU:    isDefaultCPU,
-		IsDefaultRam:    isDefaultRam,
+		IsDefaultRAM:    isDefaultRAM,
 		Flavor:          flavor,
 	}
 }
