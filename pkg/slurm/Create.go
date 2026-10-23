@@ -319,7 +319,6 @@ func (h *SidecarHandler) SubmitHandler(w http.ResponseWriter, r *http.Request) {
 		gangJID, submitted, err := h.bufferGangMember(spanCtx, member, size)
 		if err != nil {
 			span.AddEvent("Failed to submit the gang SLURM Job")
-			statusCode = http.StatusInternalServerError
 			h.handleError(spanCtx, w, http.StatusGatewayTimeout, err)
 			os.RemoveAll(filesPath)
 			return
@@ -346,7 +345,9 @@ func (h *SidecarHandler) SubmitHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		w.WriteHeader(statusCode)
 		commonIL.SetDurationSpan(start, span, commonIL.WithHTTPReturnCode(statusCode))
-		w.Write(returnedJIDBytes)
+		if _, err := w.Write(returnedJIDBytes); err != nil {
+			log.G(h.Ctx).Error(err)
+		}
 		return
 	}
 

@@ -1,27 +1,33 @@
 package slurm
 
-// Launcher injection.
+// Site launchers.
 //
-// A gang pod may carry `interlink.eu/launcher: <name>`. When present, the gang
-// plugin resolves `<name>.sh` from the launcher registry (SlurmConfig.
-// LauncherRegistryPath, a mounted ConfigMap), validates it, materialises it next
-// to job.slurm, and drives the launch through the shell function `launcher_main`
-// the file defines. The launch shape (torchrun / mpirun / srun / ray-bootstrap +
-// module loads + fabric/NUMA env) thus lives in a hot-reloadable ConfigMap instead
-// of the plugin binary. Topology (per-rank vs collective) is declared IN the file.
+// How a distributed job starts differs from one HPC site to the next: modules to
+// load, srun or mpirun, PMIx flavour, fabric libraries to bind into the container,
+// NCCL/UCX settings. None of that belongs in the plugin, so each site provides ONE
+// bash file (SlurmConfig.SiteScriptPath, typically a mounted ConfigMap):
 //
-// CRASH, DO NOT FALL BACK: when a launcher is explicitly requested, any problem
-// (bad name, missing file, missing/ambiguous topology directive, missing
-// launcher_main, `bash -n` failure) makes the gang submit fail loudly rather than
-// silently reverting to a built-in default. A silent fallback would hide that the
-// operator's launcher never ran. See interlink-vk/in-cluster-bsc/gang/CLAUDE.md.
+//   - its top level runs at the start of every gang job (modules, exports);
+//   - it defines one function per framework, named `<name>-launcher`
+//     (torchrun-launcher, mpi-launcher, ray-launcher, ...). A gang whose pods carry
+//     `interlink.eu/launcher: <name>` is started by calling that function ONCE from
+//     the batch script, with the head pod's command as arguments. The function
+//     starts every rank itself (srun, mpirun) and its return code ends every pod.
+//
+// The plugin keeps what is the same everywhere: grouping the pods, one sbatch for
+// the gang, the node list, the head address, per-pod status and logs. The contract
+// a launcher function can rely on is documented in
+// docs/docs/tutorial-admins/04-site-launchers.md.
+//
+// When a launcher is requested, any problem with the site file (missing, `bash -n`
+// failure, function not defined) fails the gang submission instead of falling back
+// to another way of starting it.
 
 import (
 	"context"
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -32,109 +38,93 @@ import (
 	"al.essio.dev/pkg/shellescape"
 )
 
-// Launcher topology values (declared per launcher via the topology directive).
-const (
-	// LauncherTopologyPerRank: launcher_main runs once PER RANK inside each
-	// member's `srun --overlap` (Ray/torch env:///TF). Preserves per-pod logs+status.
-	LauncherTopologyPerRank = "per-rank"
-	// LauncherTopologyCollective: launcher_main runs ONCE from the batch script and
-	// itself fans out over the whole allocation (classic MPI: openmpi/mpich, or the
-	// Ray cluster bootstrap). Non-head members render no srun.
-	LauncherTopologyCollective = "collective"
-)
+// defaultSiteScriptPath is where the site file is mounted when the config names none.
+const defaultSiteScriptPath = "/etc/interlink/site/site.sh"
 
-// launcherEntrypoint is the fixed shell function name every launcher file must define.
-const launcherEntrypoint = "launcher_main"
+// siteFileName is the copy of the site file written next to job.slurm (on the jobs
+// directory, so the HPC sees it at the same path) and sourced by the batch script.
+const siteFileName = "site.sh"
 
-// launcherFileName is written next to job.slurm (on the sshfs-mirrored jobs dir, so
-// the HPC sees it at the same path) and `source`d by the launch section.
-const launcherFileName = "launcher.sh"
+// launcherFuncSuffix turns a launcher name into the site function that runs it.
+const launcherFuncSuffix = "-launcher"
 
 var (
-	// topologyDirectiveRe matches the required "# interlink-topology: <value>" line.
-	topologyDirectiveRe = regexp.MustCompile(`(?m)^[ \t]*#[ \t]*interlink-topology:[ \t]*(per-rank|collective)[ \t]*$`)
-	// launcherMainRe matches a bash definition of launcher_main
-	// (`launcher_main() {` or `function launcher_main`).
-	launcherMainRe = regexp.MustCompile(`(?m)^[ \t]*(function[ \t]+launcher_main\b|launcher_main[ \t]*\([ \t]*\))`)
-	// launcherNameRe restricts launcher names to a safe filename token (no path sep,
-	// no dot-dot). The <name>.sh file must live directly under the registry dir.
-	launcherNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+	// launcherNameRe restricts launcher names to a token that is also a valid part
+	// of a bash function name.
+	launcherNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
+	// siteFuncRe matches the definition of a `<name>-launcher` function.
+	siteFuncRe = regexp.MustCompile(`(?m)^[ \t]*(?:function[ \t]+)?([A-Za-z0-9][A-Za-z0-9_.-]*)` + regexp.QuoteMeta(launcherFuncSuffix) + `[ \t]*(?:\([ \t]*\))?[ \t]*\{?[ \t]*$`)
+	// tasksPerGPURe matches "# interlink-tasks-per-gpu: <name> [<name>...]": the
+	// launchers that want one Slurm task per GPU (mpirun reads its slots from the
+	// allocation); the others get one task per node.
+	tasksPerGPURe = regexp.MustCompile(`(?m)^[ \t]*#[ \t]*interlink-tasks-per-gpu:[ \t]*(.+?)[ \t]*$`)
 	// gresGPURe extracts N from --gres=gpu:N or --gres=gpu:<type>:N.
 	gresGPURe = regexp.MustCompile(`^--gres=gpu(?::[A-Za-z0-9_.-]+)*:(\d+)$`)
-	// gpusPerNodeFlagRe extracts N from --gpus-per-node=N.
-	gpusPerNodeFlagRe = regexp.MustCompile(`^--gpus-per-node=(\d+)$`)
+	// gpusPerNodeFlagRe extracts N from --gpus-per-node=N or --gpus-per-node=<type>:N.
+	gpusPerNodeFlagRe = regexp.MustCompile(`^--gpus-per-node=(?:[A-Za-z0-9_.-]+:)?(\d+)$`)
 )
 
-// launcherDef is a validated launcher ready to be materialised.
-type launcherDef struct {
-	Name     string
-	Topology string // LauncherTopologyPerRank | LauncherTopologyCollective
-	Body     string // full file contents, written verbatim to launcher.sh
+// siteDef is a loaded and checked site file.
+type siteDef struct {
+	Path        string
+	Body        string
+	Launchers   map[string]bool // launcher names with a `<name>-launcher` function
+	TasksPerGPU map[string]bool // launchers that get one Slurm task per GPU
 }
 
-// launcherRegistryDir returns the configured registry dir (never empty: func.go
-// defaults it to /etc/interlink/launchers).
-func launcherRegistryDir(config SlurmConfig) string {
-	if d := strings.TrimSpace(config.LauncherRegistryPath); d != "" {
-		return d
+func siteScriptPath(config SlurmConfig) string {
+	if p := strings.TrimSpace(config.SiteScriptPath); p != "" {
+		return p
 	}
-	return "/etc/interlink/launchers"
+	return defaultSiteScriptPath
 }
 
-// selectedLauncherName returns the launcher name requested by the pod via
-// interlink.eu/launcher, or "" if none. The deprecated gang-mode alias is handled
-// by the caller, not here.
+// selectedLauncherName returns the launcher a gang pod asks for, "" for none.
 func selectedLauncherName(metadata metav1.ObjectMeta) string {
 	return strings.TrimSpace(metadata.Annotations[LauncherAnnotation])
 }
 
-// loadLauncher reads, validates, and returns the requested launcher. Read FRESH on
-// every call (no caching) so a ConfigMap edit hot-reloads without a plugin restart.
-// Returns an error on ANY problem (crash-no-fallback).
-func loadLauncher(Ctx context.Context, config SlurmConfig, name string) (*launcherDef, error) {
-	name = strings.TrimSpace(name)
-	if !launcherNameRe.MatchString(name) {
-		return nil, fmt.Errorf("invalid launcher name %q (allowed pattern %s)", name, launcherNameRe.String())
-	}
-	dir := filepath.Clean(launcherRegistryDir(config))
-	path := filepath.Join(dir, name+".sh")
-	// Defence-in-depth against traversal even though launcherNameRe forbids '/'.
-	if path != filepath.Join(dir, name+".sh") || !strings.HasPrefix(path, dir+string(os.PathSeparator)) {
-		return nil, fmt.Errorf("launcher %q resolves outside the registry dir %q", name, dir)
-	}
+// loadSite reads and checks the site file. A missing file is not an error by
+// itself (ok=false): it only is when a pod asks for a launcher.
+func loadSite(ctx context.Context, config SlurmConfig) (*siteDef, bool, error) {
+	path := siteScriptPath(config)
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("cannot read launcher %q at %s: %w", name, path, err)
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("cannot read site file %s: %w", path, err)
+	}
+	if err := bashSyntaxCheck(ctx, path); err != nil {
+		return nil, false, fmt.Errorf("site file %s: bash -n failed: %w", path, err)
 	}
 	body := string(raw)
-
-	m := topologyDirectiveRe.FindAllStringSubmatch(body, -1)
-	if len(m) == 0 {
-		return nil, fmt.Errorf("launcher %q (%s): missing '# interlink-topology: per-rank|collective' directive", name, path)
+	site := &siteDef{Path: path, Body: body, Launchers: map[string]bool{}, TasksPerGPU: map[string]bool{}}
+	for _, m := range siteFuncRe.FindAllStringSubmatch(body, -1) {
+		site.Launchers[m[1]] = true
 	}
-	topology := m[0][1]
-	for _, mm := range m[1:] {
-		if mm[1] != topology {
-			return nil, fmt.Errorf("launcher %q (%s): conflicting interlink-topology directives (%s vs %s)", name, path, topology, mm[1])
+	for _, m := range tasksPerGPURe.FindAllStringSubmatch(body, -1) {
+		for _, name := range strings.Fields(m[1]) {
+			site.TasksPerGPU[name] = true
 		}
 	}
-	if !launcherMainRe.MatchString(body) {
-		return nil, fmt.Errorf("launcher %q (%s): does not define a %s function", name, path, launcherEntrypoint)
-	}
-	if err := bashSyntaxCheck(Ctx, path); err != nil {
-		return nil, fmt.Errorf("launcher %q (%s): bash -n failed: %w", name, path, err)
-	}
-
-	log.G(Ctx).Infof("Gang launcher %q loaded (topology=%s) from %s", name, topology, path)
-	return &launcherDef{Name: name, Topology: topology, Body: body}, nil
+	return site, true, nil
 }
 
-// bashSyntaxCheck runs `bash -n <path>` in the plugin container to reject a broken
-// launcher before it ever reaches the HPC. A real syntax error is fatal
-// (crash-no-fallback). If no bash binary can be found in the plugin container the
-// check is SKIPPED with a loud warning (tooling gap, not a launcher defect): the
-// launcher will still be re-parsed by the HPC shell via job.slurm's shebang.
-func bashSyntaxCheck(Ctx context.Context, path string) error {
+// checkLauncher fails unless the site file defines the launcher a gang asks for.
+func (s *siteDef) checkLauncher(name string) error {
+	if !launcherNameRe.MatchString(name) {
+		return fmt.Errorf("invalid launcher name %q (allowed pattern %s)", name, launcherNameRe.String())
+	}
+	if !s.Launchers[name] {
+		return fmt.Errorf("site file %s does not define %s%s()", s.Path, name, launcherFuncSuffix)
+	}
+	return nil
+}
+
+// bashSyntaxCheck runs `bash -n <path>`. If no bash is present in the plugin
+// container the check is skipped with a warning; the HPC shell still parses the file.
+func bashSyntaxCheck(ctx context.Context, path string) error {
 	var bin string
 	for _, c := range []string{"bash", "/bin/bash", "/usr/bin/bash"} {
 		if p, err := exec.LookPath(c); err == nil {
@@ -143,32 +133,29 @@ func bashSyntaxCheck(Ctx context.Context, path string) error {
 		}
 	}
 	if bin == "" {
-		log.G(Ctx).Warningf("launcher syntax check skipped: no bash found in plugin container; relying on HPC-side shebang for %s", path)
+		log.G(ctx).Warningf("site file syntax check skipped: no bash found in plugin container; relying on HPC-side shebang for %s", path)
 		return nil
 	}
-	out, err := exec.CommandContext(Ctx, bin, "-n", path).CombinedOutput()
+	out, err := exec.CommandContext(ctx, bin, "-n", path).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
 
-// writeLauncherFile materialises def.Body to <headPath>/launcher.sh (0644) so both
-// the batch script (collective) and each rank's `srun bash -c` (per-rank) can
-// `source` it. It lives on the sshfs-mirrored jobs dir, so the path is identical on
-// the HPC. Returns the absolute path.
-func writeLauncherFile(headPath string, def *launcherDef) (string, error) {
-	p := headPath + "/" + launcherFileName
-	if err := os.WriteFile(p, []byte(def.Body), 0o644); err != nil {
-		return "", fmt.Errorf("write launcher.sh: %w", err)
+// writeSiteFile copies the site file next to job.slurm, so a ConfigMap update never
+// changes a job that is already queued. Returns the absolute path.
+func writeSiteFile(headPath string, site *siteDef) (string, error) {
+	p := headPath + "/" + siteFileName
+	if err := os.WriteFile(p, []byte(site.Body), 0o644); err != nil { //nolint:gosec // read by the job on the HPC side
+		return "", fmt.Errorf("write %s: %w", siteFileName, err)
 	}
 	return p, nil
 }
 
 // gpusPerNodeFromFlags extracts the GPUs-per-node count the allocation grants, from
-// the resolved sbatch flags: --gpus-per-node=N wins, else --gres=gpu[:type]:N.
-// Returns 0 when no GPU flag is present. Used for the one-rank-per-GPU (gang6)
-// ntasks-per-node and exported as GANG_GPUS_PER_NODE for the launcher.
+// the resolved sbatch flags: --gpus-per-node wins, else --gres=gpu[:type]:N.
+// Returns 0 when no GPU flag is present.
 func gpusPerNodeFromFlags(flags []string) int {
 	for _, f := range flags {
 		if m := gpusPerNodeFlagRe.FindStringSubmatch(strings.TrimSpace(f)); m != nil {
@@ -187,11 +174,10 @@ func gpusPerNodeFromFlags(flags []string) int {
 	return 0
 }
 
-// launcherWorkload extracts, from a member's rendered container commands, the pieces
-// launcher_main is invoked with: the container-exec PREFIX (runtimeCommand joined,
-// e.g. `singularity exec <opts> <SIF>`, exported as GANG_CONTAINER) and the APP
-// argv (containerCommand + containerArgs, passed as launcher_main's positional args).
-// It uses the FIRST non-init container. ok=false when there is no workload container.
+// launcherWorkload extracts, from a member's rendered container commands, the
+// container-exec PREFIX (runtimeCommand joined, e.g. `singularity exec <opts> <SIF>`,
+// exported as GANG_CONTAINER) and the APP argv (containerCommand + containerArgs,
+// passed to the launcher function). It uses the FIRST non-init container.
 func launcherWorkload(rcs []ContainerCommand) (prefix string, appArgs []string, ctnName string, ok bool) {
 	for i := range rcs {
 		if rcs[i].isInitContainer {
@@ -205,8 +191,7 @@ func launcherWorkload(rcs []ContainerCommand) (prefix string, appArgs []string, 
 	return "", nil, "", false
 }
 
-// shellescapeArgs joins argv into a single shell-safe, space-separated string
-// (each element quoted), for interpolation after `launcher_main`.
+// shellescapeArgs joins argv into a single shell-safe, space-separated string.
 func shellescapeArgs(args []string) string {
 	parts := make([]string, len(args))
 	for i, a := range args {

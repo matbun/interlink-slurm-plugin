@@ -201,11 +201,16 @@ func NewSlurmConfig() (SlurmConfig, error) {
 		if SlurmConfigInst.GangTimeout == "" {
 			SlurmConfigInst.GangTimeout = "10m"
 		}
-		if os.Getenv("LAUNCHERREGISTRYPATH") != "" {
-			SlurmConfigInst.LauncherRegistryPath = os.Getenv("LAUNCHERREGISTRYPATH")
+		if os.Getenv("SITESCRIPTPATH") != "" {
+			SlurmConfigInst.SiteScriptPath = os.Getenv("SITESCRIPTPATH")
 		}
-		if SlurmConfigInst.LauncherRegistryPath == "" {
-			SlurmConfigInst.LauncherRegistryPath = "/etc/interlink/launchers"
+		if os.Getenv("GPUFLAG") != "" {
+			SlurmConfigInst.GPUFlag = os.Getenv("GPUFLAG")
+		}
+		switch SlurmConfigInst.GPUFlag {
+		case "", GPUFlagGres, GPUFlagGPUsPerNode, GPUFlagGPUs:
+		default:
+			return SlurmConfigInst, fmt.Errorf("GPUFlag %q: want %q, %q or %q", SlurmConfigInst.GPUFlag, GPUFlagGres, GPUFlagGPUsPerNode, GPUFlagGPUs)
 		}
 		if SlurmConfigInst.GangSchedulingEnabled {
 			// Reject exactly what the runtime (gangGuaranteeTimeout) would refuse to

@@ -4,18 +4,53 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
 
-// writeTestLauncher writes a minimal valid launcher (topology directive +
-// launcher_main) into dir, returning nothing (fatal on error).
-func writeTestLauncher(t *testing.T, dir, name, topology, body string) {
+// Literals shared by the gang and launcher tests.
+const (
+	testBashPath         = "/bin/bash"
+	testModuleLoad       = "module load singularity"
+	testFlagsAnnotation  = "slurm-job.vk.io/flags"
+	testMPIEnvAnnotation = "slurm-job.vk.io/mpi-env"
+	testPython           = "python"
+	testScript           = "t.py"
+	testGres4            = "--gres=gpu:4"
+	testNV               = "--nv"
+	testTrainScript      = "train.py"
+	testNamespace        = "default"
+	testContainer        = "main"
+)
+
+// testRay is a launcher the test site does not define.
+const testRay = "ray"
+
+// testSite is a site file with a top level and two launchers, mpi marked for one
+// Slurm task per GPU.
+const testSite = `# test site
+module load singularity
+export SITE_LOADED=1
+
+# interlink-tasks-per-gpu: mpi
+
+torchrun-launcher() {
+  srun --ntasks-per-node=1 --output="$GANG_LOG_DIR/rank-%n.out" $GANG_CONTAINER torchrun --nnodes="$GANG_NNODES" "$@"
+}
+
+function mpi-launcher {
+  mpirun -n "$(( GANG_NNODES * GANG_GPUS_PER_NODE ))" $GANG_CONTAINER "$@"
+}
+`
+
+func writeSite(t *testing.T, body string) string {
 	t.Helper()
-	content := "# interlink-topology: " + topology + "\nlauncher_main() {\n" + body + "\n}\n"
-	if err := os.WriteFile(dir+"/"+name+".sh", []byte(content), 0o644); err != nil {
-		t.Fatalf("write launcher %s: %v", name, err)
+	p := filepath.Join(t.TempDir(), "site.sh")
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
 	}
+	return p
 }
 
 func TestGpusPerNodeFromFlags(t *testing.T) {
@@ -23,196 +58,145 @@ func TestGpusPerNodeFromFlags(t *testing.T) {
 		flags []string
 		want  int
 	}{
-		{[]string{"--gres=gpu:2"}, 2},
-		{[]string{"--gres=gpu:h100:4"}, 4},
-		{[]string{"--gpus-per-node=3", "--gres=gpu:1"}, 3}, // --gpus-per-node wins
-		{[]string{"-A", "acct", "--gres=gpu:8", "-t", "01:00:00"}, 8},
-		{[]string{"--cpus-per-task=40"}, 0}, // no GPU flag
 		{nil, 0},
+		{[]string{testGres4}, 4},
+		{[]string{"--gres=gpu:h100:2"}, 2},
+		{[]string{"--gpus-per-node=3"}, 3},
+		{[]string{"--gpus-per-node=h100:3"}, 3},
+		{[]string{testGres4, "--gpus-per-node=2"}, 2},
+		{[]string{"--gres=lscratch:10"}, 0},
 	}
 	for _, c := range cases {
 		if got := gpusPerNodeFromFlags(c.flags); got != c.want {
-			t.Errorf("gpusPerNodeFromFlags(%v)=%d want %d", c.flags, got, c.want)
+			t.Errorf("gpusPerNodeFromFlags(%v) = %d, want %d", c.flags, got, c.want)
 		}
 	}
 }
 
-func TestLoadLauncherValidatesAndCrashesNoFallback(t *testing.T) {
-	dir := t.TempDir()
-	cfg := SlurmConfig{LauncherRegistryPath: dir}
+func TestLoadSite(t *testing.T) {
 	ctx := context.Background()
 
-	// valid collective launcher
-	writeTestLauncher(t, dir, "good-col", "collective", "  echo hi")
-	// valid per-rank launcher
-	writeTestLauncher(t, dir, "good-pr", "per-rank", "  echo hi")
-	// missing topology directive
-	if err := os.WriteFile(dir+"/no-topo.sh", []byte("launcher_main() { echo x; }\n"), 0o644); err != nil {
-		t.Fatal(err)
+	site, ok, err := loadSite(ctx, SlurmConfig{SiteScriptPath: writeSite(t, testSite)})
+	if err != nil || !ok {
+		t.Fatalf("loadSite: ok=%v err=%v", ok, err)
 	}
-	// missing launcher_main
-	if err := os.WriteFile(dir+"/no-main.sh", []byte("# interlink-topology: per-rank\necho x\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	// broken bash
-	if err := os.WriteFile(dir+"/broken.sh", []byte("# interlink-topology: per-rank\nlauncher_main() {\n  if [ ; then\n}\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	// conflicting topology directives
-	if err := os.WriteFile(dir+"/conflict.sh", []byte("# interlink-topology: per-rank\n# interlink-topology: collective\nlauncher_main() { :; }\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	if d, err := loadLauncher(ctx, cfg, "good-col"); err != nil || d.Topology != LauncherTopologyCollective {
-		t.Errorf("good-col: got def=%+v err=%v; want collective, nil", d, err)
-	}
-	if d, err := loadLauncher(ctx, cfg, "good-pr"); err != nil || d.Topology != LauncherTopologyPerRank {
-		t.Errorf("good-pr: got def=%+v err=%v; want per-rank, nil", d, err)
-	}
-	for _, bad := range []string{"no-topo", "no-main", "conflict", "does-not-exist", "../etc/passwd", "bad name", ""} {
-		if _, err := loadLauncher(ctx, cfg, bad); err == nil {
-			t.Errorf("loadLauncher(%q) must error (crash-no-fallback), got nil", bad)
+	for _, name := range []string{"torchrun", "mpi"} {
+		if err := site.checkLauncher(name); err != nil {
+			t.Errorf("checkLauncher(%q): %v", name, err)
 		}
 	}
-	// broken bash: only fails when a bash binary is present to catch it (LookPath).
-	if _, err := loadLauncher(ctx, cfg, "broken"); err == nil {
-		if _, lp := lookBash(); lp {
-			t.Errorf("broken.sh must fail bash -n when bash is available")
+	if !site.TasksPerGPU["mpi"] || site.TasksPerGPU["torchrun"] {
+		t.Errorf("TasksPerGPU = %v, want only mpi", site.TasksPerGPU)
+	}
+	for _, bad := range []string{testRay, "../etc/passwd", "bad name", ""} {
+		if err := site.checkLauncher(bad); err == nil {
+			t.Errorf("checkLauncher(%q) must fail", bad)
+		}
+	}
+
+	if _, ok, err := loadSite(ctx, SlurmConfig{SiteScriptPath: filepath.Join(t.TempDir(), "none.sh")}); ok || err != nil {
+		t.Errorf("a missing site file is not an error by itself: ok=%v err=%v", ok, err)
+	}
+	if _, hasBash := lookBash(); hasBash {
+		if _, _, err := loadSite(ctx, SlurmConfig{SiteScriptPath: writeSite(t, "torchrun-launcher() {\n")}); err == nil {
+			t.Error("a site file that does not parse must fail")
 		}
 	}
 }
 
 // lookBash reports whether a bash binary is on PATH (mirrors bashSyntaxCheck).
 func lookBash() (string, bool) {
-	for _, c := range []string{"bash", "/bin/bash", "/usr/bin/bash"} {
-		if _, err := exec.LookPath(c); err == nil {
-			return c, true
+	for _, c := range []string{"bash", testBashPath, "/usr/bin/bash"} {
+		if p, err := exec.LookPath(c); err == nil {
+			return p, true
 		}
 	}
 	return "", false
 }
 
-func TestProduceGangSLURMScriptLauncherCollective(t *testing.T) {
+func renderGang(t *testing.T, config SlurmConfig, extra map[string]string, cmd, args []string) (string, string) {
+	t.Helper()
 	dataRoot := t.TempDir() + string(os.PathSeparator)
-	reg := t.TempDir()
-	writeTestLauncher(t, reg, "mpi-openmpi", "collective",
-		`  local n=$(( GANG_NNODES * GANG_GPUS_PER_NODE ))`+"\n"+`  mpirun -n "$n" ${GANG_CONTAINER} "$@"`)
-	config := SlurmConfig{BashPath: "/bin/bash", Commandprefix: "module load singularity", LauncherRegistryPath: reg}
-	extra := map[string]string{LauncherAnnotation: "mpi-openmpi", "slurm-job.vk.io/flags": "--gres=gpu:2"}
 	entry := &GangEntry{Name: "g1", Size: 2, Members: map[string]*BufferedMember{
-		"h": mkGangMemberWithRC(t, dataRoot, "h", GangRoleHead, 2, extra, []string{"python"}, []string{"mpi_cpu.py"}),
-		"w": mkGangMemberWithRC(t, dataRoot, "w", GangRoleWorker, 2, extra, []string{"python"}, []string{"mpi_cpu.py"}),
+		"h": mkGangMemberWithRC(t, dataRoot, "h", GangRoleHead, 2, extra, cmd, args),
+		"w": mkGangMemberWithRC(t, dataRoot, "w", GangRoleWorker, 2, extra, cmd, args),
 	}}
-	ordered := assignRanks(entry.Members)
-	path, err := produceGangSLURMScript(context.Background(), config, entry, ordered)
+	path, err := produceGangSLURMScript(context.Background(), config, entry, assignRanks(entry.Members))
 	if err != nil {
 		t.Fatalf("produceGangSLURMScript: %v", err)
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("read: %v", err)
+		t.Fatal(err)
 	}
-	s := string(b)
+	return string(b), dataRoot
+}
 
-	// launcher.sh materialised in the head dir with the body.
-	lp := dataRoot + "default-h/" + launcherFileName
-	if lb, err := os.ReadFile(lp); err != nil || !strings.Contains(string(lb), "launcher_main") {
-		t.Errorf("launcher.sh not materialised at %s (err=%v)", lp, err)
-	}
+func TestProduceGangSLURMScriptSiteLauncher(t *testing.T) {
+	config := SlurmConfig{BashPath: testBashPath, Commandprefix: testModuleLoad, SiteScriptPath: writeSite(t, testSite)}
+	extra := map[string]string{LauncherAnnotation: "torchrun", testFlagsAnnotation: testGres4}
+	s, dataRoot := renderGang(t, config, extra, []string{testPython}, []string{testTrainScript})
+
+	head, worker := dataRoot+"default-h/", dataRoot+"default-w/"
 	for _, want := range []string{
-		"source " + lp,               // sourced
-		"launcher_main python mpi_cpu.py", // called with the app argv
-		"export GANG_CONTAINER=",     // container prefix exported
+		"source " + head + siteFileName,          // site top level runs in the batch shell
+		"torchrun-launcher python train.py ) >>", // called once with the head pod's command
+		"export GANG_CONTAINER=",
 		"export GANG_NNODES=2",
-		"export GANG_GPUS_PER_NODE=2",
-		"#SBATCH --ntasks-per-node=2", // gang6: one task per GPU for collective
-		`export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK}"`,
+		"export GANG_GPUS_PER_NODE=4",
+		`export GANG_NODES="${nodes[*]}"`,
+		"export GANG_LOG_DIR=" + head + "ranks",
+		"ln -sfn " + head + "ranks/rank-1.out " + worker + "run-main.out", // worker's log is rank 1's
+		"#SBATCH --ntasks-per-node=1",
+		`echo "$LAUNCHER_RC" > ` + worker + "run-main.status",
 	} {
 		if !strings.Contains(s, want) {
-			t.Errorf("collective launcher script missing %q\n---\n%s", want, s)
+			t.Errorf("site launcher script missing %q\n---\n%s", want, s)
 		}
 	}
-	// collective: no per-rank loop, no readiness barrier, no built-in --mpi= launcher.
-	for _, unwanted := range []string{"srun --overlap --nodes=1 --ntasks=1", "/dev/tcp/$head_ip/$MASTER_PORT", `--mpi="${SLURM_MPI_TYPE`} {
-		if strings.Contains(s, unwanted) {
-			t.Errorf("collective launcher must NOT contain %q\n---\n%s", unwanted, s)
-		}
+	if strings.Contains(s, "srun --overlap --nodes=1 --ntasks=1 -w \"${nodes[1]}\"") {
+		t.Errorf("a site launcher starts the ranks itself: no per-pod srun expected\n---\n%s", s)
+	}
+	if _, err := os.Stat(head + siteFileName); err != nil {
+		t.Errorf("site file not copied next to job.slurm: %v", err)
 	}
 }
 
-func TestProduceGangSLURMScriptLauncherPerRank(t *testing.T) {
-	dataRoot := t.TempDir() + string(os.PathSeparator)
-	reg := t.TempDir()
-	writeTestLauncher(t, reg, "torchrun", "per-rank",
-		`  ${GANG_CONTAINER} torchrun --node-rank="$RANK" --no-python "$@"`)
-	config := SlurmConfig{BashPath: "/bin/bash", Commandprefix: "module load singularity", LauncherRegistryPath: reg}
-	// --gres=gpu:2 is present but per-rank must still pin --ntasks-per-node=1.
-	extra := map[string]string{LauncherAnnotation: "torchrun", "slurm-job.vk.io/flags": "--gres=gpu:2"}
-	entry := &GangEntry{Name: "g1", Size: 2, Members: map[string]*BufferedMember{
-		"h": mkGangMemberWithRC(t, dataRoot, "h", GangRoleHead, 2, extra, []string{"python"}, []string{"train.py"}),
-		"w": mkGangMemberWithRC(t, dataRoot, "w", GangRoleWorker, 2, extra, []string{"python"}, []string{"train.py"}),
-	}}
-	ordered := assignRanks(entry.Members)
-	path, err := produceGangSLURMScript(context.Background(), config, entry, ordered)
-	if err != nil {
-		t.Fatalf("produceGangSLURMScript: %v", err)
+func TestProduceGangSLURMScriptTasksPerGPU(t *testing.T) {
+	config := SlurmConfig{BashPath: testBashPath, SiteScriptPath: writeSite(t, testSite)}
+	extra := map[string]string{LauncherAnnotation: "mpi", testFlagsAnnotation: testGres4}
+	s, _ := renderGang(t, config, extra, []string{"invert_test"}, nil)
+	if !strings.Contains(s, "#SBATCH --ntasks-per-node=4") {
+		t.Errorf("mpi is marked interlink-tasks-per-gpu: want one task per GPU\n---\n%s", s)
 	}
-	b, _ := os.ReadFile(path)
-	s := string(b)
+}
 
-	// Per-rank loop present (2 members + barrier probe = 3 overlap sruns), header pins 1/node.
-	if got := strings.Count(s, "srun --overlap --nodes=1 --ntasks=1"); got != 3 {
-		t.Errorf("per-rank launcher must emit 3 overlap sruns (2 members + barrier), got %d\n---\n%s", got, s)
-	}
-	for _, want := range []string{
-		"#SBATCH --ntasks-per-node=1", // per-rank ignores GPUs for tasks/node
-		"source " + dataRoot + "default-h/" + launcherFileName,
-		"launcher_main python train.py",
-		"default-h/run-main.status", // per-pod status write
-		"default-w/run-main.status",
-		"/dev/tcp/$head_ip/$MASTER_PORT", // readiness barrier kept
-		"exit \"$DRIVER_RC\"",            // DRIVER_RC tail kept
+func TestSiteLauncherFailsWithoutFallback(t *testing.T) {
+	extra := map[string]string{LauncherAnnotation: testRay}
+	dataRoot := t.TempDir() + string(os.PathSeparator)
+	for name, config := range map[string]SlurmConfig{
+		"no site file":         {BashPath: testBashPath, SiteScriptPath: filepath.Join(t.TempDir(), "none.sh")},
+		"launcher not defined": {BashPath: testBashPath, SiteScriptPath: writeSite(t, testSite)},
 	} {
-		if !strings.Contains(s, want) {
-			t.Errorf("per-rank launcher script missing %q\n---\n%s", want, s)
+		entry := &GangEntry{Name: "g1", Size: 2, Members: map[string]*BufferedMember{
+			"h": mkGangMemberWithRC(t, dataRoot, "h", GangRoleHead, 2, extra, []string{testRay}, nil),
+			"w": mkGangMemberWithRC(t, dataRoot, "w", GangRoleWorker, 2, extra, []string{testRay}, nil),
+		}}
+		if _, err := produceGangSLURMScript(context.Background(), config, entry, assignRanks(entry.Members)); err == nil {
+			t.Errorf("%s: the submission must fail, not fall back", name)
 		}
 	}
 }
 
-func TestLauncherMissingRegistryCrashes(t *testing.T) {
-	dataRoot := t.TempDir() + string(os.PathSeparator)
-	config := SlurmConfig{BashPath: "/bin/bash", LauncherRegistryPath: t.TempDir()} // empty registry
-	extra := map[string]string{LauncherAnnotation: "does-not-exist"}
-	entry := &GangEntry{Name: "g1", Size: 1, Members: map[string]*BufferedMember{
-		"h": mkGangMemberWithRC(t, dataRoot, "h", GangRoleHead, 1, extra, []string{"python"}, []string{"x.py"}),
-	}}
-	ordered := assignRanks(entry.Members)
-	if _, err := produceGangSLURMScript(context.Background(), config, entry, ordered); err == nil {
-		t.Fatalf("a missing launcher must FAIL the submit (crash-no-fallback), got nil error")
+// Without a launcher annotation the site top level still runs, and each pod runs its
+// own command (one srun per member).
+func TestSiteTopLevelWithoutLauncher(t *testing.T) {
+	config := SlurmConfig{BashPath: testBashPath, SiteScriptPath: writeSite(t, testSite)}
+	s, dataRoot := renderGang(t, config, nil, []string{testPython}, []string{testScript})
+	if !strings.Contains(s, "source "+dataRoot+"default-h/"+siteFileName) {
+		t.Errorf("site file must be sourced for every gang\n---\n%s", s)
 	}
-}
-
-func TestLauncherAnnotationOverridesGangMode(t *testing.T) {
-	dataRoot := t.TempDir() + string(os.PathSeparator)
-	reg := t.TempDir()
-	writeTestLauncher(t, reg, "mpi-openmpi", "collective", `  mpirun ${GANG_CONTAINER} "$@"`)
-	config := SlurmConfig{BashPath: "/bin/bash", LauncherRegistryPath: reg}
-	// BOTH annotations set: launcher must win, gang-mode built-in must NOT fire.
-	extra := map[string]string{LauncherAnnotation: "mpi-openmpi", GangModeAnnotation: GangModeMPI}
-	entry := &GangEntry{Name: "g1", Size: 1, Members: map[string]*BufferedMember{
-		"h": mkGangMemberWithRC(t, dataRoot, "h", GangRoleHead, 1, extra, []string{"python"}, []string{"x.py"}),
-	}}
-	ordered := assignRanks(entry.Members)
-	path, err := produceGangSLURMScript(context.Background(), config, entry, ordered)
-	if err != nil {
-		t.Fatalf("produceGangSLURMScript: %v", err)
-	}
-	b, _ := os.ReadFile(path)
-	s := string(b)
-	if !strings.Contains(s, "source "+dataRoot+"default-h/"+launcherFileName) {
-		t.Errorf("launcher must win over gang-mode (expected the launcher to be sourced)\n---\n%s", s)
-	}
-	if strings.Contains(s, `--mpi="${SLURM_MPI_TYPE`) {
-		t.Errorf("built-in gang-mode MPI launcher must NOT fire when interlink.eu/launcher is set\n---\n%s", s)
+	if !strings.Contains(s, `srun --overlap --nodes=1 --ntasks=1 -w "${nodes[1]}"`) {
+		t.Errorf("without a launcher each pod gets its own srun\n---\n%s", s)
 	}
 }

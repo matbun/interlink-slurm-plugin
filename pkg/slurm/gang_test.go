@@ -34,7 +34,7 @@ func newGangPod(uid, gangName, role string, size int, extra map[string]string) v
 	return v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        "pod-" + uid,
-			Namespace:   "default",
+			Namespace:   testNamespace,
 			UID:         types.UID(uid),
 			Annotations: ann,
 		},
@@ -45,7 +45,7 @@ func newGangPod(uid, gangName, role string, size int, extra map[string]string) v
 func writeStubScript(t *testing.T, dir, name, body string) string {
 	t.Helper()
 	p := filepath.Join(dir, name)
-	if err := os.WriteFile(p, []byte("#!/bin/sh\n"+body+"\n"), 0o755); err != nil {
+	if err := os.WriteFile(p, []byte("#!/bin/sh\n"+body+"\n"), 0o755); err != nil { //nolint:gosec // a fake executable
 		t.Fatalf("write stub %s: %v", name, err)
 	}
 	return p
@@ -66,7 +66,7 @@ func newHandlerWithStubs(t *testing.T, jid string) (*SidecarHandler, string, str
 	jids := make(map[string]*JidStruct)
 	h := &SidecarHandler{
 		Config: SlurmConfig{
-			BashPath:              "/bin/bash",
+			BashPath:              testBashPath,
 			Sbatchpath:            sbatch,
 			Scancelpath:           scancel,
 			DataRootFolder:        dataRoot,
@@ -111,7 +111,7 @@ func bufferPod(t *testing.T, h *SidecarHandler, pod v1.Pod, size int) (string, b
 		t.Fatalf("mkdir member dir: %v", err)
 	}
 	// A minimal job.sh so the member dir looks like a real rendered member.
-	if err := os.WriteFile(filesPath+"/job.sh", []byte("#!/bin/bash\ntrue\n"), 0o755); err != nil {
+	if err := os.WriteFile(filesPath+"/job.sh", []byte("#!/bin/bash\ntrue\n"), 0o755); err != nil { //nolint:gosec // a fake executable
 		t.Fatalf("write member job.sh: %v", err)
 	}
 	member := gangMemberFromCreate(pod, filesPath, nil, ResourceLimits{}, true, true, nil)
@@ -335,20 +335,23 @@ func TestGangRunningPerRankStatusIsolated(t *testing.T) {
 
 	// The failing rank (worker) has written its own non-zero run-main.status; the
 	// healthy rank (head) has NOT written any status file yet (still running).
-	if err := os.WriteFile(memberDir(dataRoot, "w")+"/run-main.status", []byte("1\n"), 0o644); err != nil {
+	if err := os.WriteFile(memberDir(dataRoot, "w")+"/run-main.status", []byte("1\n"), 0o600); err != nil {
 		t.Fatalf("write worker status: %v", err)
 	}
 
 	// Build the pods with a container named "main" (Status iterates pod.Spec.Containers).
 	withCtn := func(p v1.Pod) *v1.Pod {
-		p.Spec.Containers = []v1.Container{{Name: "main"}}
+		p.Spec.Containers = []v1.Container{{Name: testContainer}}
 		return &p
 	}
 	reqPods := []*v1.Pod{withCtn(head), withCtn(worker)}
-	body, _ := json.Marshal(reqPods)
+	body, err := json.Marshal(reqPods)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Reset the 10s status cache window so the handler recomputes.
-	timer = time.Time{}
+	resetStatusCache()
 
 	req := httptest.NewRequest(http.MethodPost, "/status", strings.NewReader(string(body)))
 	rec := httptest.NewRecorder()
@@ -401,16 +404,19 @@ func TestSinglePodRunningStatusUnaffected(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	if err := os.WriteFile(dir+"/run-main.status", []byte("1\n"), 0o644); err != nil {
+	if err := os.WriteFile(dir+"/run-main.status", []byte("1\n"), 0o600); err != nil {
 		t.Fatalf("write status: %v", err)
 	}
-	(*h.JIDs)[uid] = &JidStruct{PodUID: uid, PodNamespace: "default", JID: "42"} // Gang=false
+	(*h.JIDs)[uid] = &JidStruct{PodUID: uid, PodNamespace: testNamespace, JID: "42"} // Gang=false
 
-	pod := v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "solo", Namespace: "default", UID: types.UID(uid)}}
-	pod.Spec.Containers = []v1.Container{{Name: "main"}}
-	body, _ := json.Marshal([]*v1.Pod{&pod})
+	pod := v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "solo", Namespace: testNamespace, UID: types.UID(uid)}}
+	pod.Spec.Containers = []v1.Container{{Name: testContainer}}
+	body, err := json.Marshal([]*v1.Pod{&pod})
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	timer = time.Time{}
+	resetStatusCache()
 	req := httptest.NewRequest(http.MethodPost, "/status", strings.NewReader(string(body)))
 	rec := httptest.NewRecorder()
 	h.StatusHandler(rec, req)
@@ -437,7 +443,9 @@ func TestLateArrivalAfterCleanup(t *testing.T) {
 		t.Fatalf("buffer: %v", err)
 	}
 	// Delete the only member -> entry dropped.
-	_ = simulateDelete(t, h, "a", memberDir(dataRoot, "a"))
+	if err := simulateDelete(t, h, "a", memberDir(dataRoot, "a")); err != nil {
+		t.Fatal(err)
+	}
 	if _, ok := h.GangTable["g1"]; ok {
 		t.Fatal("entry should be gone before late arrival")
 	}
@@ -567,7 +575,7 @@ func TestProduceGangSLURMScriptShape(t *testing.T) {
 	// A non-empty CommandPrefix mirrors a real deployment (e.g. BSC's
 	// `module load singularity`); the gang script MUST emit it ONCE at the
 	// batch level (see the regression assertions below).
-	config := SlurmConfig{BashPath: "/bin/bash", Commandprefix: "module load singularity"}
+	config := SlurmConfig{BashPath: testBashPath, Commandprefix: testModuleLoad}
 
 	mk := func(uid, role string) *BufferedMember {
 		dir := dataRoot + "default-" + uid
@@ -622,12 +630,12 @@ func TestProduceGangSLURMScriptShape(t *testing.T) {
 	// with "singularity: command not found" (exit 127). Emitting it once at the
 	// batch level runs `module load` where `module` is defined; the resulting PATH
 	// then propagates to every rank via `srun --export=ALL`.
-	if got := strings.Count(s, "module load singularity"); got != 1 {
+	if got := strings.Count(s, testModuleLoad); got != 1 {
 		t.Errorf("CommandPrefix must run once at the batch level: got %d occurrences of 'module load singularity', want 1\n---\n%s", got, s)
 	}
 	// It must appear BEFORE the first per-rank srun (i.e. at the batch level). If it
 	// came after, it would be inside a rank's bash -c (the 127 regression).
-	if cp, sr := strings.Index(s, "module load singularity"), strings.Index(s, "srun --overlap"); cp < 0 || sr < 0 || cp > sr {
+	if cp, sr := strings.Index(s, testModuleLoad), strings.Index(s, "srun --overlap"); cp < 0 || sr < 0 || cp > sr {
 		t.Errorf("CommandPrefix must be emitted at the batch level (before the first per-rank srun): module@%d srun@%d\n---\n%s", cp, sr, s)
 	}
 	// The per-rank inner must be its own compute-node write followed by
@@ -685,7 +693,7 @@ func TestConcurrentGangBufferAndDelete(t *testing.T) {
 		if err := os.MkdirAll(filesPath, 0o755); err != nil {
 			return err
 		}
-		if err := os.WriteFile(filesPath+"/job.sh", []byte("#!/bin/bash\ntrue\n"), 0o755); err != nil {
+		if err := os.WriteFile(filesPath+"/job.sh", []byte("#!/bin/bash\ntrue\n"), 0o755); err != nil { //nolint:gosec // a fake executable
 			return err
 		}
 		member := gangMemberFromCreate(newGangPod(uid, gang, role, 2, nil), filesPath, nil, ResourceLimits{}, true, true, nil)
@@ -943,7 +951,7 @@ func TestSubmittedGangSameUIDIdempotentEvenIfJobGone(t *testing.T) {
 // resolved the job-level output dir (the head dir) for every rank and raced.
 func TestGangScriptWritesPerRankComputeNode(t *testing.T) {
 	dataRoot := t.TempDir() + string(os.PathSeparator)
-	config := SlurmConfig{BashPath: "/bin/bash", Commandprefix: "module load singularity"}
+	config := SlurmConfig{BashPath: testBashPath, Commandprefix: testModuleLoad}
 
 	mk := func(uid, role string) *BufferedMember {
 		dir := dataRoot + "default-" + uid
@@ -1006,7 +1014,7 @@ func TestGangScriptWritesPerRankComputeNode(t *testing.T) {
 // newest-compute-node-file race for gang heads.
 func TestGangScriptPublishesGangHeadDiscoveryFile(t *testing.T) {
 	dataRoot := t.TempDir() + string(os.PathSeparator)
-	config := SlurmConfig{BashPath: "/bin/bash", DataRootFolder: dataRoot, Commandprefix: "module load singularity"}
+	config := SlurmConfig{BashPath: testBashPath, DataRootFolder: dataRoot, Commandprefix: testModuleLoad}
 
 	mk := func(uid, role string) *BufferedMember {
 		dir := dataRoot + "default-" + uid
@@ -1061,10 +1069,10 @@ func mkGangMemberWithRC(t *testing.T, dataRoot, uid, role string, size int, extr
 		t.Fatalf("mkdir: %v", err)
 	}
 	rc := []ContainerCommand{{
-		containerName: "main",
+		containerName: testContainer,
 		// runtimeCommand mirrors Create.go: singularity exec <opts> <mounts> <SIF>.
 		// The SIF path is the LAST element (rc.runtimeCommand already includes it).
-		runtimeCommand:   []string{"singularity", "exec", "--nv", "--no-home", "", "", "/gpfs/images/itwinai.sif"},
+		runtimeCommand:   []string{singularityRuntime, string(ProbeTypeExec), testNV, "--no-home", "", "", "/gpfs/images/itwinai.sif"},
 		containerCommand: cmd,
 		containerArgs:    args,
 		containerImage:   "/gpfs/images/itwinai.sif",
@@ -1080,10 +1088,10 @@ func mkGangMemberWithRC(t *testing.T, dataRoot, uid, role string, size int, extr
 func TestProduceGangSLURMScriptDefaultModeUnchanged(t *testing.T) {
 	run := func(t *testing.T, extra map[string]string) string {
 		dataRoot := t.TempDir() + string(os.PathSeparator)
-		config := SlurmConfig{BashPath: "/bin/bash", Commandprefix: "module load singularity"}
+		config := SlurmConfig{BashPath: testBashPath, Commandprefix: testModuleLoad}
 		entry := &GangEntry{Name: "g1", Size: 2, Members: map[string]*BufferedMember{
-			"h": mkGangMemberWithRC(t, dataRoot, "h", GangRoleHead, 2, extra, []string{"python"}, []string{"train.py"}),
-			"w": mkGangMemberWithRC(t, dataRoot, "w", GangRoleWorker, 2, extra, []string{"python"}, []string{"train.py"}),
+			"h": mkGangMemberWithRC(t, dataRoot, "h", GangRoleHead, 2, extra, []string{testPython}, []string{testTrainScript}),
+			"w": mkGangMemberWithRC(t, dataRoot, "w", GangRoleWorker, 2, extra, []string{testPython}, []string{testTrainScript}),
 		}}
 		ordered := assignRanks(entry.Members)
 		path, err := produceGangSLURMScript(context.Background(), config, entry, ordered)
@@ -1134,7 +1142,7 @@ func TestProduceGangSLURMScriptDefaultModeUnchanged(t *testing.T) {
 	// torch-style: same shape, no Ray specifics needed; the per-rank + barrier +
 	// DRIVER_RC contract is identical (torch consumes MASTER_ADDR/RANK/WORLD_SIZE).
 	t.Run("torch", func(t *testing.T) {
-		s := run(t, map[string]string{"slurm-job.vk.io/singularity-options": "--nv"})
+		s := run(t, map[string]string{"slurm-job.vk.io/singularity-options": testNV})
 		// 2 member sruns + 1 barrier probe srun = 3.
 		if got := strings.Count(s, "srun --overlap --nodes=1 --ntasks=1"); got != 3 {
 			t.Errorf("torch default mode must emit one per-rank srun per member plus the barrier probe (3), got %d\n---\n%s", got, s)
@@ -1151,92 +1159,15 @@ func TestProduceGangSLURMScriptDefaultModeUnchanged(t *testing.T) {
 	})
 }
 
-// MPI mode: with gang-mode=mpi, exactly ONE srun launcher spanning the whole
-// allocation, NO per-rank overlap loop, NO readiness barrier, the
-// SRUN_CPUS_PER_TASK export, the --mpi= flag, and the singularity exec
-// reconstruction (runtimeCommand join + shellescaped command/args) present.
-func TestProduceGangSLURMScriptMPIMode(t *testing.T) {
-	dataRoot := t.TempDir() + string(os.PathSeparator)
-	config := SlurmConfig{BashPath: "/bin/bash", Commandprefix: "module load singularity"}
-	mpiExtra := map[string]string{GangModeAnnotation: GangModeMPI}
-	entry := &GangEntry{Name: "g1", Size: 2, Members: map[string]*BufferedMember{
-		"h": mkGangMemberWithRC(t, dataRoot, "h", GangRoleHead, 2, mpiExtra, []string{"python"}, []string{"mpi_hello.py"}),
-		"w": mkGangMemberWithRC(t, dataRoot, "w", GangRoleWorker, 2, mpiExtra, []string{"python"}, []string{"mpi_hello.py"}),
-	}}
-	ordered := assignRanks(entry.Members)
-	path, err := produceGangSLURMScript(context.Background(), config, entry, ordered)
-	if err != nil {
-		t.Fatalf("produceGangSLURMScript: %v", err)
-	}
-	b, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read gang script: %v", err)
-	}
-	s := string(b)
-
-	// Exactly one MPI launcher srun; zero per-rank overlap sruns.
-	if got := strings.Count(s, "srun --mpi="); got != 1 {
-		t.Errorf("MPI mode must emit exactly ONE MPI launcher srun, got %d\n---\n%s", got, s)
-	}
-	if strings.Contains(s, "srun --overlap --nodes=1 --ntasks=1") {
-		t.Errorf("MPI mode must NOT emit the per-rank overlap loop\n---\n%s", s)
-	}
-	// No readiness barrier in MPI mode (PMIx does the rendezvous).
-	if strings.Contains(s, "/dev/tcp/$head_ip/$MASTER_PORT") {
-		t.Errorf("MPI mode must NOT emit the readiness barrier\n---\n%s", s)
-	}
-	// No DRIVER_RC / RANK_PIDS tail: the single srun rc is the whole-job rc.
-	if strings.Contains(s, "DRIVER_RC") || strings.Contains(s, "RANK_PIDS") {
-		t.Errorf("MPI mode must NOT emit the DRIVER_RC/RANK_PIDS per-rank tail\n---\n%s", s)
-	}
-	// The MN5 SRUN_CPUS_PER_TASK export must be present.
-	if !strings.Contains(s, `export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK}"`) {
-		t.Errorf("MPI mode must export SRUN_CPUS_PER_TASK from SLURM_CPUS_PER_TASK\n---\n%s", s)
-	}
-	// The --mpi flag defaults to pmix (overridable via SLURM_MPI_TYPE).
-	if !strings.Contains(s, `--mpi="${SLURM_MPI_TYPE:-pmix}"`) {
-		t.Errorf("MPI mode must emit --mpi with the pmix default\n---\n%s", s)
-	}
-	// One task per node: --nodes/--ntasks span the whole allocation, one per node.
-	for _, want := range []string{`--nodes="$WORLD_SIZE"`, `--ntasks="$WORLD_SIZE"`, "--ntasks-per-node=1"} {
-		if !strings.Contains(s, want) {
-			t.Errorf("MPI mode launcher missing %q\n---\n%s", want, s)
-		}
-	}
-	// Output routed to the HEAD member's dir.
-	if !strings.Contains(s, "-o "+dataRoot+"default-h/job.out") || !strings.Contains(s, "-e "+dataRoot+"default-h/job.err") {
-		t.Errorf("MPI launcher must route -o/-e to the head member dir\n---\n%s", s)
-	}
-	// The container invocation reconstruction: runtimeCommand joined + the SIF +
-	// the shellescaped command/args (exactly as runCtn does).
-	if !strings.Contains(s, "singularity exec --nv --no-home") {
-		t.Errorf("MPI launcher must reconstruct the singularity exec prefix\n---\n%s", s)
-	}
-	if !strings.Contains(s, "/gpfs/images/itwinai.sif") {
-		t.Errorf("MPI launcher must include the SIF path from runtimeCommand\n---\n%s", s)
-	}
-	if !strings.Contains(s, "python mpi_hello.py") {
-		t.Errorf("MPI launcher must include the shellescaped container command/args\n---\n%s", s)
-	}
-	// Only ONE srun total (the launcher). scontrol hostnames uses srun for head_ip;
-	// count MPI launcher separately above. Non-head members render no srun of
-	// their own -> no second --mpi launcher (asserted above by count==1).
-
-	// The CommandPrefix must still run once at the batch level in MPI mode too.
-	if got := strings.Count(s, "module load singularity"); got != 1 {
-		t.Errorf("MPI mode must still run CommandPrefix once at the batch level, got %d\n---\n%s", got, s)
-	}
-}
-
 // mpi-env hook: SINGULARITYENV_<K> exports appear for a given annotation, in BOTH
 // modes; and are ABSENT when the annotation is unset.
 func TestGangScriptMPIEnvHook(t *testing.T) {
 	renderWith := func(t *testing.T, extra map[string]string) string {
 		dataRoot := t.TempDir() + string(os.PathSeparator)
-		config := SlurmConfig{BashPath: "/bin/bash", Commandprefix: "module load singularity"}
+		config := SlurmConfig{BashPath: testBashPath, Commandprefix: testModuleLoad}
 		entry := &GangEntry{Name: "g1", Size: 2, Members: map[string]*BufferedMember{
-			"h": mkGangMemberWithRC(t, dataRoot, "h", GangRoleHead, 2, extra, []string{"python"}, []string{"t.py"}),
-			"w": mkGangMemberWithRC(t, dataRoot, "w", GangRoleWorker, 2, extra, []string{"python"}, []string{"t.py"}),
+			"h": mkGangMemberWithRC(t, dataRoot, "h", GangRoleHead, 2, extra, []string{testPython}, []string{testScript}),
+			"w": mkGangMemberWithRC(t, dataRoot, "w", GangRoleWorker, 2, extra, []string{testPython}, []string{testScript}),
 		}}
 		ordered := assignRanks(entry.Members)
 		path, err := produceGangSLURMScript(context.Background(), config, entry, ordered)
@@ -1252,7 +1183,7 @@ func TestGangScriptMPIEnvHook(t *testing.T) {
 
 	// Present in DEFAULT (per-rank) mode.
 	t.Run("default-mode", func(t *testing.T) {
-		s := renderWith(t, map[string]string{"slurm-job.vk.io/mpi-env": "NCCL_DEBUG=INFO;UCX_TLS=rc,ud"})
+		s := renderWith(t, map[string]string{testMPIEnvAnnotation: "NCCL_DEBUG=INFO;UCX_TLS=rc,ud"})
 		for _, want := range []string{
 			`export SINGULARITYENV_NCCL_DEBUG=INFO`,
 			`export SINGULARITYENV_UCX_TLS=`, // value shellescaped; prefix is enough
@@ -1267,20 +1198,6 @@ func TestGangScriptMPIEnvHook(t *testing.T) {
 		}
 	})
 
-	// Present in MPI mode too.
-	t.Run("mpi-mode", func(t *testing.T) {
-		s := renderWith(t, map[string]string{
-			GangModeAnnotation:        GangModeMPI,
-			"slurm-job.vk.io/mpi-env": "UCX_NET_DEVICES=mlx5_0:1",
-		})
-		if !strings.Contains(s, `export SINGULARITYENV_UCX_NET_DEVICES=mlx5_0:1`) {
-			t.Errorf("MPI mode must emit mpi-env export\n---\n%s", s)
-		}
-		if e, sr := strings.Index(s, "SINGULARITYENV_UCX_NET_DEVICES"), strings.Index(s, "srun --mpi="); e < 0 || sr < 0 || e > sr {
-			t.Errorf("mpi-env exports must precede the MPI launcher: env@%d srun@%d\n---\n%s", e, sr, s)
-		}
-	})
-
 	// Absent when the annotation is unset.
 	t.Run("unset", func(t *testing.T) {
 		s := renderWith(t, nil)
@@ -1291,7 +1208,7 @@ func TestGangScriptMPIEnvHook(t *testing.T) {
 
 	// Malformed/empty pairs are skipped, valid ones still emitted.
 	t.Run("skips-malformed", func(t *testing.T) {
-		s := renderWith(t, map[string]string{"slurm-job.vk.io/mpi-env": "NCCL_DEBUG=INFO;;NOEQUALS;=novalue;GOOD=1"})
+		s := renderWith(t, map[string]string{testMPIEnvAnnotation: "NCCL_DEBUG=INFO;;NOEQUALS;=novalue;GOOD=1"})
 		if !strings.Contains(s, `export SINGULARITYENV_NCCL_DEBUG=INFO`) || !strings.Contains(s, `export SINGULARITYENV_GOOD=1`) {
 			t.Errorf("valid pairs must still be emitted alongside malformed ones\n---\n%s", s)
 		}
@@ -1304,7 +1221,7 @@ func TestGangScriptMPIEnvHook(t *testing.T) {
 	// `export SINGULARITYENV_<K>` interpolation (hardening the key side; the value
 	// is already shellescaped). A hostile key must not reach the export line.
 	t.Run("rejects-unsafe-key", func(t *testing.T) {
-		s := renderWith(t, map[string]string{"slurm-job.vk.io/mpi-env": "GOOD_1=ok;BAD-KEY=x;E vil=y;X;rm -rf /=z"})
+		s := renderWith(t, map[string]string{testMPIEnvAnnotation: "GOOD_1=ok;BAD-KEY=x;E vil=y;X;rm -rf /=z"})
 		if !strings.Contains(s, `export SINGULARITYENV_GOOD_1=ok`) {
 			t.Errorf("valid key GOOD_1 must still be emitted\n---\n%s", s)
 		}
@@ -1320,8 +1237,8 @@ func TestGangScriptMPIEnvHook(t *testing.T) {
 // runtimeCommand (previously ranged over a value copy and was discarded).
 func TestBuildSbatchFlagsMPIFlagsPrependsMpiexec(t *testing.T) {
 	commands := []ContainerCommand{
-		{containerName: "a", runtimeCommand: []string{"singularity", "exec", "img.sif"}},
-		{containerName: "b", runtimeCommand: []string{"singularity", "run", "other.sif"}},
+		{containerName: "a", runtimeCommand: []string{singularityRuntime, string(ProbeTypeExec), "img.sif"}},
+		{containerName: "b", runtimeCommand: []string{singularityRuntime, "run", "other.sif"}},
 	}
 	meta := metav1.ObjectMeta{Annotations: map[string]string{
 		"slurm-job.vk.io/mpi-flags": "--bind-to core",
@@ -1388,7 +1305,7 @@ func TestKueuePodGroupKeys(t *testing.T) {
 	pod := func(uid string, labels map[string]string) v1.Pod {
 		labels[PodGroupNameLabel] = "rc-1"
 		return v1.Pod{ObjectMeta: metav1.ObjectMeta{
-			Name: uid, Namespace: "default", UID: types.UID(uid), Labels: labels,
+			Name: uid, Namespace: testNamespace, UID: types.UID(uid), Labels: labels,
 			Annotations: map[string]string{PodGroupTotalCountAnnotation: "2"},
 		}}
 	}
