@@ -1288,6 +1288,39 @@ func TestPrepareMountsSkipsPersistentVolumeClaim(t *testing.T) {
 	}
 }
 
+func TestPrepareMountsMemoryEmptyDirAtDevShm(t *testing.T) {
+	const ctn = "ray-head"
+	pod := v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "head", Namespace: "alice"},
+		Spec: v1.PodSpec{
+			Volumes: []v1.Volume{
+				{Name: "shared-mem", VolumeSource: v1.VolumeSource{EmptyDir: &v1.EmptyDirVolumeSource{Medium: v1.StorageMediumMemory}}},
+				{Name: "scratch", VolumeSource: v1.VolumeSource{EmptyDir: &v1.EmptyDirVolumeSource{}}},
+			},
+			Containers: []v1.Container{{
+				Name: ctn,
+				VolumeMounts: []v1.VolumeMount{
+					{Name: "shared-mem", MountPath: "/dev/shm"},
+					{Name: "scratch", MountPath: "/scratch"},
+				},
+			}},
+		},
+	}
+	podData := &commonIL.RetrievedPodData{Pod: pod, Containers: []commonIL.RetrievedContainer{{Name: ctn}}}
+
+	mounts, err := prepareMounts(context.Background(), SlurmConfig{ContainerRuntime: "singularity", ExportPodData: true}, podData, &pod.Spec.Containers[0], t.TempDir())
+
+	if err != nil {
+		t.Fatalf("prepareMounts: %v", err)
+	}
+	if strings.Contains(mounts, "/dev/shm") {
+		t.Errorf("a memory emptyDir at /dev/shm must leave the node's /dev/shm in place, got %q", mounts)
+	}
+	if !strings.Contains(mounts, "emptyDirs/scratch:/scratch") {
+		t.Errorf("a disk emptyDir is still a directory of the job, got %q", mounts)
+	}
+}
+
 // TestProduceSLURMScriptSinglePodGolden locks the exact single-pod job.slurm
 // #SBATCH header and overall structure so the buildSbatchFlags extraction (and
 // any future refactor) is regression-guarded. If this test changes, the
