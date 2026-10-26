@@ -506,6 +506,13 @@ func emitSiteLauncher(body *strings.Builder, ordered []*BufferedMember, name, so
 	// pod; launchers use it unquoted, e.g. `srun ... $GANG_CONTAINER "$@"`.
 	body.WriteString("export GANG_CONTAINER=" + shellescape.Quote(prefix) + "\n")
 	body.WriteString("hostname -f > " + shellescape.Quote(head.FilesPath+"/compute-node") + " || true\n")
+	// The other members' pods learn their node too, or their shadows never can (and a
+	// virtual kubelet that holds a pod until its shadow serves never readies them): rank i
+	// runs on the allocation's i-th node, as the site launchers start them (GANG_NODES order).
+	for _, m := range ordered[1:] {
+		body.WriteString(`srun --overlap -N1 -n1 -w "${nodes[` + strconv.Itoa(m.Rank) + `]}" hostname -f > ` +
+			shellescape.Quote(m.FilesPath+"/compute-node") + " || true\n")
+	}
 	if socketDir := socketDirFor(socketRoot, head.PodUID); socketDir != "" {
 		body.WriteString("export INTERLINK_SOCKET_DIR=" + shellescape.Quote(socketDir) + "\n")
 	}
