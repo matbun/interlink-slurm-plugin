@@ -17,12 +17,19 @@ import (
 )
 
 // EstimateRequest asks when Slurm would start a job of Nodes nodes with GPUsPerNode
-// GPUs each, submitted now with the default flavor's flags. Used by a Kueue admission
-// check, so that a multi-node job is admitted only when the site can run it soon.
+// GPUs each, submitted now with the default flavor's flags and, when set, the CPUs each
+// node's task needs (sites that tie CPUs to GPUs refuse a GPU job without them) and the
+// job's own time limit (HH:MM:SS), which backfill depends on. Used by a Kueue admission check, so
+// that a multi-node job is admitted only when the site can run it soon.
 type EstimateRequest struct {
-	Nodes       int `json:"nodes"`
-	GPUsPerNode int `json:"gpusPerNode"`
+	Nodes       int    `json:"nodes"`
+	GPUsPerNode int    `json:"gpusPerNode"`
+	CPUsPerNode int    `json:"cpusPerNode,omitempty"`
+	Time        string `json:"time,omitempty"`
 }
+
+// estimateTimeRe is the only time limit form passed on: the flags reach a shell.
+var estimateTimeRe = regexp.MustCompile(`^\d{1,3}:[0-5]\d:[0-5]\d$`)
 
 // EstimateResponse is Slurm's answer: the expected start time, and its raw output.
 type EstimateResponse struct {
@@ -39,6 +46,13 @@ func estimateFlags(config SlurmConfig, req EstimateRequest) []string {
 	flags := []string{"--test-only", "--nodes=" + strconv.Itoa(req.Nodes), "--ntasks-per-node=1"}
 	if flavor, ok := config.Flavors[config.DefaultFlavor]; ok {
 		flags = append(flags, flavor.SlurmFlags...)
+	}
+	if req.CPUsPerNode > 0 {
+		flags = append(flags, "--cpus-per-task="+strconv.Itoa(req.CPUsPerNode))
+	}
+	if req.Time != "" {
+		// after the flavor's flags: sbatch keeps the last --time
+		flags = append(flags, "--time="+req.Time)
 	}
 	if req.GPUsPerNode > 0 && !hasGPUFlag(flags) {
 		switch config.GPUFlag {
@@ -65,13 +79,29 @@ func hasGPUFlag(flags []string) bool {
 }
 
 // parseTestOnly returns the start time Slurm announced, in the local time zone of the
-// site (Slurm prints local time without a zone).
-func parseTestOnly(output string, loc *time.Location) (time.Time, error) {
+// site (Slurm prints local time without a zone). In the hour that repeats when summer time
+// ends, a local time has two readings: Slurm means the earliest that is not in the past (a
+// start estimate never is), where ParseInLocation may pick the later one.
+func parseTestOnly(output string, loc *time.Location, now time.Time) (time.Time, error) {
+	const layout = "2006-01-02T15:04:05"
 	m := testOnlyStartRe.FindStringSubmatch(output)
 	if m == nil {
 		return time.Time{}, fmt.Errorf("no start time in sbatch --test-only output: %q", strings.TrimSpace(output))
 	}
-	return time.ParseInLocation("2006-01-02T15:04:05", m[1], loc)
+	parsed, err := time.ParseInLocation(layout, m[1], loc)
+	if err != nil {
+		return parsed, err
+	}
+	start := parsed
+	for _, c := range []time.Time{parsed.Add(-time.Hour), parsed, parsed.Add(time.Hour)} {
+		if c.In(loc).Format(layout) != m[1] || c.Before(now.Add(-time.Minute)) {
+			continue
+		}
+		if start.Before(now.Add(-time.Minute)) || c.Before(start) {
+			start = c
+		}
+	}
+	return start, nil
 }
 
 // EstimateHandler answers POST /estimate with when Slurm would start such a job now.
@@ -81,8 +111,11 @@ func (h *SidecarHandler) EstimateHandler(w http.ResponseWriter, r *http.Request)
 	if err == nil {
 		err = json.Unmarshal(body, &req)
 	}
+	if err == nil && req.Time != "" && !estimateTimeRe.MatchString(req.Time) {
+		err = fmt.Errorf("time %q is not HH:MM:SS", req.Time)
+	}
 	if err != nil || req.Nodes < 1 {
-		http.Error(w, fmt.Sprintf("want {\"nodes\": N >= 1, \"gpusPerNode\": M}: %v", err), http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("want {\"nodes\": N >= 1, \"gpusPerNode\": M, \"time\": \"HH:MM:SS\"}: %v", err), http.StatusBadRequest)
 		return
 	}
 	task := exec.ExecTask{Command: h.Config.Sbatchpath, Args: estimateFlags(h.Config, req), Shell: true}
@@ -99,7 +132,7 @@ func (h *SidecarHandler) EstimateHandler(w http.ResponseWriter, r *http.Request)
 			return
 		}
 	}
-	start, err := parseTestOnly(out, loc)
+	start, err := parseTestOnly(out, loc, time.Now())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return

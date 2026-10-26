@@ -149,6 +149,8 @@ func TestProduceGangSLURMScriptSiteLauncher(t *testing.T) {
 		"ln -sfn " + head + "ranks/rank-1.out " + worker + "run-main.out", // worker's log is rank 1's
 		"#SBATCH --ntasks-per-node=1",
 		`echo "$LAUNCHER_RC" > ` + worker + "run-main.status",
+		// the worker's pod learns its node (rank 1, the second node) for its shadow
+		`srun --overlap -N1 -n1 -w "${nodes[1]}" hostname -f > ` + worker + "compute-node",
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("site launcher script missing %q\n---\n%s", want, s)
