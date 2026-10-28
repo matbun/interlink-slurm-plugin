@@ -292,8 +292,8 @@ func (h *SidecarHandler) renderPod(spanCtx context.Context, data commonIL.Retrie
 		runtime_command_pod = append(runtime_command_pod, ContainerCommand{
 			runtimeCommand:   runtime_command,
 			containerName:    container.Name,
-			containerArgs:    container.Args,
-			containerCommand: container.Command,
+			containerArgs:    expandContainerArgs(container.Args, container.Env),
+			containerCommand: expandContainerArgs(container.Command, container.Env),
 			isInitContainer:  isInit,
 			readinessProbes:  readinessProbes,
 			livenessProbes:   livenessProbes,
