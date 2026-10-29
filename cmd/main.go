@@ -146,7 +146,7 @@ func initProvider(ctx context.Context) (func(context.Context) error, error) {
 	return tracerProvider.Shutdown, nil
 }
 func main() {
-	// "logs" streams a workload's logs from an agent, for a shadow's job-logs
+	// "logs" streams a workload's logs from an executor, for a shadow's job-logs
 	// container. It reads no plugin configuration.
 	if len(os.Args) > 1 && os.Args[1] == "logs" {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -221,23 +221,23 @@ func main() {
 	mutex.HandleFunc("/system-info", SidecarAPIs.SystemInfoHandler)
 	mutex.HandleFunc("/estimate", SidecarAPIs.EstimateHandler)
 
-	if slurmConfig.Dispatch.Enabled {
+	if slurmConfig.Executor.Enabled {
 		kube, err := slurm.InClusterClient()
 		if err != nil {
-			log.G(ctx).Fatal("dispatch: no in-cluster Kubernetes client: ", err)
+			log.G(ctx).Fatal("executor: no in-cluster Kubernetes client: ", err)
 		}
 		var shadows slurm.ShadowManager
 		if slurmConfig.Shadow.Enabled {
 			shadows, err = slurm.NewShadowManager(kube, slurmConfig)
 			if err != nil {
-				log.G(ctx).Fatal("dispatch: shadow: ", err)
+				log.G(ctx).Fatal("executor: shadow: ", err)
 			}
 		}
-		dispatcher, err := slurm.NewDispatcher(&SidecarAPIs, kube, shadows)
+		executor, err := slurm.NewExecutor(&SidecarAPIs, kube, shadows)
 		if err != nil {
-			log.G(ctx).Fatal("dispatch: ", err)
+			log.G(ctx).Fatal("executor: ", err)
 		}
-		dispatcher.RegisterRoutes(mutex)
+		executor.RegisterRoutes(mutex)
 	} else {
 		mutex.HandleFunc("/getLogs", SidecarAPIs.GetLogsHandler)
 		mutex.HandleFunc("GET /healthz", slurm.HealthzHandler)

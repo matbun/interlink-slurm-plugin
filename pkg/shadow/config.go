@@ -46,23 +46,23 @@ const (
 	DefaultNodeWaitTimeout = "2h"
 	// DefaultExecConnectCommand relays a connection on stdin/stdout in exec mode.
 	DefaultExecConnectCommand = "nc"
-	// AgentImageEnv names the environment variable AgentImage falls back to.
-	AgentImageEnv = "AGENT_IMAGE"
+	// ExecutorImageEnv names the environment variable ExecutorImage falls back to.
+	ExecutorImageEnv = "EXECUTOR_IMAGE"
 )
 
-// Config is the agent's Shadow block. LoginHost and User have no default here: the
-// agent fills them from its site before NewManager when they are empty.
+// Config is the executor's Shadow block. LoginHost and User have no default here: the
+// executor fills them from its site before NewManager when they are empty.
 type Config struct {
 	// Image runs the shadow's ssh containers (default DefaultImage).
 	Image string `yaml:"Image"`
-	// AgentImage runs the job-logs container: the agent's own image. Empty: the
-	// AGENT_IMAGE environment variable.
-	AgentImage string `yaml:"AgentImage"`
-	// AgentURL is where job-logs reaches the agent, e.g. http://interlink-agent:8000.
-	AgentURL  string `yaml:"AgentURL"`
-	LoginHost string `yaml:"LoginHost"`
-	User      string `yaml:"User"`
-	Port      int    `yaml:"Port"`
+	// ExecutorImage runs the job-logs container: the executor's own image. Empty: the
+	// EXECUTOR_IMAGE environment variable.
+	ExecutorImage string `yaml:"ExecutorImage"`
+	// ExecutorURL is where job-logs reaches the executor, e.g. http://kueue-offload-executor:8000.
+	ExecutorURL string `yaml:"ExecutorURL"`
+	LoginHost   string `yaml:"LoginHost"`
+	User        string `yaml:"User"`
+	Port        int    `yaml:"Port"`
 	// KeySecret is the namespace's Secret holding the tunnel's private key, under
 	// KeySecretKey (default "ssh-privatekey").
 	KeySecret    string `yaml:"KeySecret"`
@@ -97,20 +97,20 @@ var (
 )
 
 // NormalizeConfig fills in the defaults and rejects values the shadow cannot use,
-// so the agent can fail at startup rather than at the first job.
+// so the executor can fail at startup rather than at the first job.
 func NormalizeConfig(cfg *Config) error {
 	if cfg.Image == "" {
 		cfg.Image = DefaultImage
 	}
-	if cfg.AgentImage == "" {
-		cfg.AgentImage = os.Getenv(AgentImageEnv)
+	if cfg.ExecutorImage == "" {
+		cfg.ExecutorImage = os.Getenv(ExecutorImageEnv)
 	}
-	if cfg.AgentImage == "" {
-		return fmt.Errorf("Shadow.AgentImage is empty and %s is not set", AgentImageEnv)
+	if cfg.ExecutorImage == "" {
+		return fmt.Errorf("Shadow.ExecutorImage is empty and %s is not set", ExecutorImageEnv)
 	}
-	u, err := url.Parse(cfg.AgentURL)
+	u, err := url.Parse(cfg.ExecutorURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return fmt.Errorf("Shadow.AgentURL %q is not an http(s) URL", cfg.AgentURL)
+		return fmt.Errorf("Shadow.ExecutorURL %q is not an http(s) URL", cfg.ExecutorURL)
 	}
 	if !isValidComputeNodeName(cfg.LoginHost) {
 		return fmt.Errorf("Shadow.LoginHost %q is not a hostname or IP address", cfg.LoginHost)

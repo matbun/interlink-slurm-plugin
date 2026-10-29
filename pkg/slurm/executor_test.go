@@ -23,26 +23,26 @@ import (
 )
 
 const (
-	dispatchNS       = "alice"
-	dispatchSite     = "hpc-a"
-	dispatchAccount  = "proj42"
-	dispatchWorkload = "0b6c1d2e-3f40-4a5b-8c6d-7e8f9a0b1c2d"
-	dispatchJobID    = "4242"
-	dispatchCtn      = "main"
-	dispatchSA       = "system:serviceaccount:interlink-dispatch:interlink-dispatch"
+	executorNS       = "alice"
+	executorSite     = "hpc-a"
+	executorAccount  = "proj42"
+	executorWorkload = "0b6c1d2e-3f40-4a5b-8c6d-7e8f9a0b1c2d"
+	executorJobID    = "4242"
+	executorCtn      = "main"
+	executorSA       = "system:serviceaccount:kueue-offload:kueue-offload"
 )
 
-// dispatchEnv is an agent whose sbatch, squeue and scancel are scripts in bin.
-// squeue answers the agent's state query with the contents of bin/state, the
+// executorEnv is an executor whose sbatch, squeue and scancel are scripts in bin.
+// squeue answers the executor's state query with the contents of bin/state, the
 // plugin's status query with bin/exitstate, and "Invalid job id" while
 // bin/gone exists. sbatch copies every script it gets to bin/sbatch.scripts,
 // and fails with the contents of bin/sbatch.stderr (exit code in
 // bin/sbatch.rc) when that file exists.
-type dispatchEnv struct {
+type executorEnv struct {
 	t        *testing.T
 	bin      string
 	dataRoot string
-	d        *Dispatcher
+	d        *Executor
 	kube     *fake.Clientset
 	shadow   *recordingShadow
 	mux      *http.ServeMux
@@ -68,7 +68,7 @@ func (s *recordingShadow) Delete(_ context.Context, uid string) error {
 	return nil
 }
 
-func newDispatchEnv(t *testing.T, objects ...runtime.Object) *dispatchEnv {
+func newExecutorEnv(t *testing.T, objects ...runtime.Object) *executorEnv {
 	t.Helper()
 	resetStatusCache()
 	t.Cleanup(resetStatusCache)
@@ -78,7 +78,7 @@ func newDispatchEnv(t *testing.T, objects ...runtime.Object) *dispatchEnv {
 cat "$1" >> `+bin+`/sbatch.scripts
 echo "#--- end of script" >> `+bin+`/sbatch.scripts
 if [ -f `+bin+`/sbatch.stderr ]; then cat `+bin+`/sbatch.stderr >&2; exit $(cat `+bin+`/sbatch.rc); fi
-echo "Submitted batch job `+dispatchJobID+`"`)
+echo "Submitted batch job `+executorJobID+`"`)
 	squeue := writeStubScript(t, bin, "squeue", `
 case "$*" in
 *--me*) exit 0 ;;
@@ -105,17 +105,17 @@ esac`)
 			GangSchedulingEnabled: true,
 			GangTimeout:           "10m",
 			SiteScriptPath:        filepath.Join(bin, "no-site.sh"),
-			Dispatch: DispatchConfig{
+			Executor: ExecutorConfig{
 				Enabled:   true,
-				Namespace: dispatchNS,
-				Auth:      DispatchAuthConfig{Mode: DispatchAuthNetwork},
-				StateDir:  dataRoot + "dispatch",
+				Namespace: executorNS,
+				Auth:      ExecutorAuthConfig{Mode: ExecutorAuthNetwork},
+				StateDir:  dataRoot + "executor",
 			},
-			Sites: map[string]SiteConfig{dispatchSite: {
+			Sites: map[string]SiteConfig{executorSite: {
 				LoginHost:       "login.hpc-a.example.org",
 				User:            "alice",
 				Port:            22,
-				AllowedAccounts: []string{dispatchAccount},
+				AllowedAccounts: []string{executorAccount},
 			}},
 			Shadow: ShadowConfig{Enabled: true},
 		},
@@ -123,36 +123,46 @@ esac`)
 		Ctx:       context.Background(),
 		GangTable: map[string]*GangEntry{},
 	}
+	// Every namespace has the cluster's CA, published by the API server.
+	hasRootCA := false
+	for _, o := range objects {
+		if cm, ok := o.(*v1.ConfigMap); ok && cm.Name == "kube-root-ca.crt" {
+			hasRootCA = true
+		}
+	}
+	if !hasRootCA {
+		objects = append(objects, &v1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "kube-root-ca.crt", Namespace: executorNS}, Data: map[string]string{"ca.crt": "-----BEGIN CERTIFICATE-----\n"}})
+	}
 	kube := fake.NewClientset(objects...)
 	shadow := &recordingShadow{}
-	d, err := NewDispatcher(h, kube, shadow)
+	d, err := NewExecutor(h, kube, shadow)
 	if err != nil {
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
 	d.RegisterRoutes(mux)
-	e := &dispatchEnv{t: t, bin: bin, dataRoot: dataRoot, d: d, kube: kube, shadow: shadow, mux: mux}
+	e := &executorEnv{t: t, bin: bin, dataRoot: dataRoot, d: d, kube: kube, shadow: shadow, mux: mux}
 	e.setState("PD Priority", "0 PD")
 	return e
 }
 
-func (e *dispatchEnv) write(name, content string) {
+func (e *executorEnv) write(name, content string) {
 	e.t.Helper()
 	if err := os.WriteFile(filepath.Join(e.bin, name), []byte(content+"\n"), 0o600); err != nil {
 		e.t.Fatal(err)
 	}
 }
 
-// setState sets what squeue reports: the agent's query (state and reason) and
+// setState sets what squeue reports: the executor's query (state and reason) and
 // the plugin's (exit code and state). The status cache is cleared, as its TTL
 // would between two polls.
-func (e *dispatchEnv) setState(state, exitState string) {
+func (e *executorEnv) setState(state, exitState string) {
 	e.write("state", state)
 	e.write("exitstate", exitState)
 	resetStatusCache()
 }
 
-func (e *dispatchEnv) read(name string) string {
+func (e *executorEnv) read(name string) string {
 	raw, err := os.ReadFile(filepath.Join(e.bin, name))
 	if err != nil && !os.IsNotExist(err) {
 		e.t.Fatal(err)
@@ -160,11 +170,11 @@ func (e *dispatchEnv) read(name string) string {
 	return string(raw)
 }
 
-func (e *dispatchEnv) memberDir(i int) string {
-	return e.dataRoot + dispatchNS + "-" + memberUID(dispatchWorkload, i)
+func (e *executorEnv) memberDir(i int) string {
+	return e.dataRoot + executorNS + "-" + memberUID(executorWorkload, i)
 }
 
-func (e *dispatchEnv) do(method, target string, body any, header ...string) *httptest.ResponseRecorder {
+func (e *executorEnv) do(method, target string, body any, header ...string) *httptest.ResponseRecorder {
 	e.t.Helper()
 	var buf bytes.Buffer
 	if body != nil {
@@ -181,9 +191,9 @@ func (e *dispatchEnv) do(method, target string, body any, header ...string) *htt
 	return rec
 }
 
-func (e *dispatchEnv) jobStatus() JobStatus {
+func (e *executorEnv) jobStatus() JobStatus {
 	e.t.Helper()
-	rec := e.do(http.MethodGet, "/jobs/"+dispatchWorkload, nil)
+	rec := e.do(http.MethodGet, "/jobs/"+executorWorkload, nil)
 	if rec.Code != http.StatusOK {
 		e.t.Fatalf("GET /jobs = %d %s", rec.Code, rec.Body.String())
 	}
@@ -196,19 +206,20 @@ func (e *dispatchEnv) jobStatus() JobStatus {
 
 func submitRequest(count int32) SubmitRequest {
 	return SubmitRequest{
-		APIVersion:   DispatchAPIVersion,
-		WorkloadUID:  dispatchWorkload,
+		APIVersion:   ExecutorAPIVersion,
+		WorkloadUID:  executorWorkload,
 		WorkloadName: "job-train-5d565",
-		Namespace:    dispatchNS,
-		Owner:        DispatchOwner{APIVersion: "batch/v1", Kind: "Job", Name: "train", UID: "owner-uid"},
-		Site:         dispatchSite,
-		Account:      dispatchAccount,
-		PodSets: []DispatchPodSet{{
+		Namespace:    executorNS,
+		Owner:        ExecutorOwner{APIVersion: "batch/v1", Kind: "Job", Name: "train", UID: "owner-uid"},
+		Site:         executorSite,
+		Account:      executorAccount,
+		PodSets: []ExecutorPodSet{{
 			Name:      "main",
 			Count:     count,
 			Partition: "gpu",
+			QOS:       "debug",
 			Template: v1.PodTemplateSpec{Spec: v1.PodSpec{Containers: []v1.Container{{
-				Name:    dispatchCtn,
+				Name:    executorCtn,
 				Image:   busyboxImage,
 				Command: []string{"sh", "-c", "echo hello"},
 			}}}},
@@ -225,16 +236,16 @@ func decodeSubmit(t *testing.T, rec *httptest.ResponseRecorder) SubmitResponse {
 	return resp
 }
 
-func decodeError(t *testing.T, rec *httptest.ResponseRecorder) DispatchError {
+func decodeError(t *testing.T, rec *httptest.ResponseRecorder) ExecutorError {
 	t.Helper()
-	var resp DispatchError
+	var resp ExecutorError
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode %q: %v", rec.Body.String(), err)
 	}
 	return resp
 }
 
-func (e *dispatchEnv) submit(req SubmitRequest) SubmitResponse {
+func (e *executorEnv) submit(req SubmitRequest) SubmitResponse {
 	e.t.Helper()
 	rec := e.do(http.MethodPost, "/submit", req)
 	if rec.Code != http.StatusCreated {
@@ -243,10 +254,10 @@ func (e *dispatchEnv) submit(req SubmitRequest) SubmitResponse {
 	return decodeSubmit(e.t, rec)
 }
 
-func TestDispatchSubmitGangIsOneJob(t *testing.T) {
-	e := newDispatchEnv(t)
+func TestExecutorSubmitGangIsOneJob(t *testing.T) {
+	e := newExecutorEnv(t)
 	resp := e.submit(submitRequest(4))
-	if resp.JobID != dispatchJobID || !resp.Accepted || resp.APIVersion != DispatchAPIVersion {
+	if resp.JobID != executorJobID || !resp.Accepted || resp.APIVersion != ExecutorAPIVersion {
 		t.Fatalf("response = %+v", resp)
 	}
 
@@ -254,17 +265,17 @@ func TestDispatchSubmitGangIsOneJob(t *testing.T) {
 	if n := strings.Count(scripts, "#--- end of script"); n != 1 {
 		t.Fatalf("sbatch ran %d times, want 1\n%s", n, scripts)
 	}
-	for _, want := range []string{"#SBATCH --nodes=4\n", "#SBATCH --account=" + dispatchAccount + "\n", "#SBATCH --partition=gpu\n", "#SBATCH --job-name=" + dispatchWorkload + "\n"} {
+	for _, want := range []string{"#SBATCH --nodes=4\n", "#SBATCH --account=" + executorAccount + "\n", "#SBATCH --partition=gpu\n", "#SBATCH --qos=debug\n", "#SBATCH --job-name=" + executorWorkload + "\n"} {
 		if !strings.Contains(scripts, want) {
 			t.Errorf("job script lacks %q\n%s", want, scripts)
 		}
 	}
 	for i := 0; i < 4; i++ {
-		uid := memberUID(dispatchWorkload, i)
-		if jid := (*e.d.Sidecar.JIDs)[uid]; jid == nil || jid.JID != dispatchJobID {
-			t.Errorf("member %d: JID entry %+v, want job %s", i, jid, dispatchJobID)
+		uid := memberUID(executorWorkload, i)
+		if jid := (*e.d.Sidecar.JIDs)[uid]; jid == nil || jid.JID != executorJobID {
+			t.Errorf("member %d: JID entry %+v, want job %s", i, jid, executorJobID)
 		}
-		env, err := os.ReadFile(e.memberDir(i) + "/" + dispatchCtn + "_envfile.properties")
+		env, err := os.ReadFile(e.memberDir(i) + "/" + executorCtn + "_envfile.properties")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -275,21 +286,21 @@ func TestDispatchSubmitGangIsOneJob(t *testing.T) {
 	if len(e.d.Sidecar.GangTable) != 1 {
 		t.Errorf("gang table has %d entries", len(e.d.Sidecar.GangTable))
 	}
-	if _, err := os.Stat(filepath.Join(e.dataRoot, "dispatch", dispatchWorkload+".json")); err != nil {
+	if _, err := os.Stat(filepath.Join(e.dataRoot, "executor", executorWorkload+".json")); err != nil {
 		t.Errorf("no record: %v", err)
 	}
 }
 
-func TestDispatchSubmitSinglePod(t *testing.T) {
-	e := newDispatchEnv(t)
-	if resp := e.submit(submitRequest(1)); resp.JobID != dispatchJobID {
+func TestExecutorSubmitSinglePod(t *testing.T) {
+	e := newExecutorEnv(t)
+	if resp := e.submit(submitRequest(1)); resp.JobID != executorJobID {
 		t.Fatalf("jobID = %q", resp.JobID)
 	}
 	scripts := e.read("sbatch.scripts")
 	if strings.Contains(scripts, "--nodes=") || strings.Contains(scripts, "gang") {
 		t.Errorf("one member must take the single-pod script\n%s", scripts)
 	}
-	if !strings.Contains(scripts, "#SBATCH --account="+dispatchAccount) || !strings.Contains(scripts, "#SBATCH --partition=gpu") {
+	if !strings.Contains(scripts, "#SBATCH --account="+executorAccount) || !strings.Contains(scripts, "#SBATCH --partition=gpu") {
 		t.Errorf("job script lacks account or partition\n%s", scripts)
 	}
 	if !strings.Contains(scripts, e.memberDir(0)+"/job.out") {
@@ -300,34 +311,34 @@ func TestDispatchSubmitSinglePod(t *testing.T) {
 	}
 }
 
-func TestDispatchSubmitIsIdempotent(t *testing.T) {
-	e := newDispatchEnv(t)
+func TestExecutorSubmitIsIdempotent(t *testing.T) {
+	e := newExecutorEnv(t)
 	e.submit(submitRequest(2))
 	rec := e.do(http.MethodPost, "/submit", submitRequest(2))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("second submit = %d %s", rec.Code, rec.Body.String())
 	}
-	if resp := decodeSubmit(t, rec); resp.JobID != dispatchJobID {
+	if resp := decodeSubmit(t, rec); resp.JobID != executorJobID {
 		t.Fatalf("second submit jobID = %q", resp.JobID)
 	}
 	if n := strings.Count(e.read("sbatch.scripts"), "#--- end of script"); n != 1 {
 		t.Fatalf("sbatch ran %d times", n)
 	}
 
-	// A restarted agent knows the workload from its record.
-	d2, err := NewDispatcher(e.d.Sidecar, e.kube, nil)
+	// A restarted executor knows the workload from its record.
+	d2, err := NewExecutor(e.d.Sidecar, e.kube, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	jobID, created, aerr := d2.submit(context.Background(), submitRequest(2))
-	if aerr != nil || created || jobID != dispatchJobID {
+	if aerr != nil || created || jobID != executorJobID {
 		t.Fatalf("after restart: %q %v %+v", jobID, created, aerr)
 	}
 }
 
 // Kueue charts the requests, so they also size the Slurm job when no limit is set.
-func TestDispatchRequestsSizeTheJob(t *testing.T) {
-	e := newDispatchEnv(t)
+func TestExecutorRequestsSizeTheJob(t *testing.T) {
+	e := newExecutorEnv(t)
 	req := submitRequest(1)
 	req.PodSets[0].Template.Spec.Containers[0].Resources = v1.ResourceRequirements{
 		Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("20"), v1.ResourceMemory: resource.MustParse("8Gi"), "nvidia.com/gpu": resource.MustParse("1")},
@@ -343,20 +354,20 @@ func TestDispatchRequestsSizeTheJob(t *testing.T) {
 }
 
 // A save interrupted between removing the old record and renaming the new one
-// leaves only <uid>.json.tmp; a restarted agent takes it as the record.
-func TestDispatchInterruptedRecordSaveRecovered(t *testing.T) {
-	e := newDispatchEnv(t)
+// leaves only <uid>.json.tmp; a restarted executor takes it as the record.
+func TestExecutorInterruptedRecordSaveRecovered(t *testing.T) {
+	e := newExecutorEnv(t)
 	e.submit(submitRequest(2))
-	path := e.d.recordPath(dispatchWorkload)
+	path := e.d.recordPath(executorWorkload)
 	if err := os.Rename(path, path+".tmp"); err != nil {
 		t.Fatal(err)
 	}
-	d2, err := NewDispatcher(e.d.Sidecar, e.kube, nil)
+	d2, err := NewExecutor(e.d.Sidecar, e.kube, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	jobID, created, aerr := d2.submit(context.Background(), submitRequest(2))
-	if aerr != nil || created || jobID != dispatchJobID {
+	if aerr != nil || created || jobID != executorJobID {
 		t.Fatalf("after restart: %q %v %+v", jobID, created, aerr)
 	}
 	if _, err := os.Stat(path); err != nil {
@@ -364,7 +375,7 @@ func TestDispatchInterruptedRecordSaveRecovered(t *testing.T) {
 	}
 }
 
-func TestDispatchSubmitRefusals(t *testing.T) {
+func TestExecutorSubmitRefusals(t *testing.T) {
 	tests := []struct {
 		name   string
 		mutate func(*SubmitRequest)
@@ -372,8 +383,8 @@ func TestDispatchSubmitRefusals(t *testing.T) {
 	}{
 		{"account not allowed", func(r *SubmitRequest) { r.Account = "proj99" }, `account "proj99" is not allowed`},
 		{"unknown site", func(r *SubmitRequest) { r.Site = "hpc-b" }, `unknown site "hpc-b"`},
-		{"foreign namespace", func(r *SubmitRequest) { r.Namespace = "bob" }, `namespace "bob" is not this agent's`},
-		{"two PodSets", func(r *SubmitRequest) { r.PodSets = append(r.PodSets, r.PodSets[0]) }, "2 PodSets"},
+		{"foreign namespace", func(r *SubmitRequest) { r.Namespace = "bob" }, `namespace "bob" is not this executor's`},
+		{"no PodSets", func(r *SubmitRequest) { r.PodSets = nil }, "no PodSets"},
 		{"unlisted reference", func(r *SubmitRequest) {
 			r.PodSets[0].Template.Spec.Containers[0].EnvFrom = []v1.EnvFromSource{{SecretRef: &v1.SecretEnvSource{LocalObjectReference: v1.LocalObjectReference{Name: "hf-token"}}}}
 		}, `Secret "hf-token", which is not in secretRefs`},
@@ -384,7 +395,7 @@ func TestDispatchSubmitRefusals(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			e := newDispatchEnv(t)
+			e := newExecutorEnv(t)
 			req := submitRequest(1)
 			tt.mutate(&req)
 			rec := e.do(http.MethodPost, "/submit", req)
@@ -405,9 +416,9 @@ func useConfigMap(r *SubmitRequest, name string) {
 	r.PodSets[0].Template.Spec.Volumes = []v1.Volume{{Name: "cfg", VolumeSource: v1.VolumeSource{ConfigMap: &v1.ConfigMapVolumeSource{LocalObjectReference: v1.LocalObjectReference{Name: name}}}}}
 }
 
-func TestDispatchSubmitSbatchRefusal(t *testing.T) {
+func TestExecutorSubmitSbatchRefusal(t *testing.T) {
 	const stderr = "sbatch: error: Batch job submission failed: Invalid account or account/partition combination specified"
-	e := newDispatchEnv(t)
+	e := newExecutorEnv(t)
 	e.write("sbatch.stderr", stderr)
 	e.write("sbatch.rc", "1")
 
@@ -419,7 +430,7 @@ func TestDispatchSubmitSbatchRefusal(t *testing.T) {
 	if !resp.Permanent || resp.Message != stderr+"\n" {
 		t.Fatalf("response = %+v, want sbatch's stderr verbatim", resp)
 	}
-	if e.d.record(dispatchWorkload) != nil || len(e.d.Sidecar.GangTable) != 0 || len(*e.d.Sidecar.JIDs) != 0 {
+	if e.d.record(executorWorkload) != nil || len(e.d.Sidecar.GangTable) != 0 || len(*e.d.Sidecar.JIDs) != 0 {
 		t.Fatalf("a refused workload left state behind")
 	}
 	for i := 0; i < 2; i++ {
@@ -446,10 +457,10 @@ func TestDispatchSubmitSbatchRefusal(t *testing.T) {
 	e.submit(submitRequest(2))
 }
 
-func TestDispatchSecretKeyRefResolved(t *testing.T) {
-	secret := &v1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "hf-token", Namespace: dispatchNS}, Data: map[string][]byte{"token": []byte("hf_s3cr3t")}}
-	config := &v1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "train-config", Namespace: dispatchNS}, Data: map[string]string{"lr": "0.001"}}
-	e := newDispatchEnv(t, secret, config)
+func TestExecutorSecretKeyRefResolved(t *testing.T) {
+	secret := &v1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "hf-token", Namespace: executorNS}, Data: map[string][]byte{"token": []byte("hf_s3cr3t")}}
+	config := &v1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "train-config", Namespace: executorNS}, Data: map[string]string{"lr": "0.001"}}
+	e := newExecutorEnv(t, secret, config)
 	req := submitRequest(1)
 	ps := &req.PodSets[0]
 	ps.SecretRefs = []string{"hf-token"}
@@ -464,7 +475,7 @@ func TestDispatchSecretKeyRefResolved(t *testing.T) {
 	}
 	e.submit(req)
 
-	raw, err := os.ReadFile(e.memberDir(0) + "/" + dispatchCtn + "_envfile.properties")
+	raw, err := os.ReadFile(e.memberDir(0) + "/" + executorCtn + "_envfile.properties")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -477,15 +488,15 @@ func TestDispatchSecretKeyRefResolved(t *testing.T) {
 	if strings.Contains(env, "OPT=") {
 		t.Errorf("an optional missing key must leave the variable out:\n%s", env)
 	}
-	if rec, _ := os.ReadFile(filepath.Join(e.dataRoot, "dispatch", dispatchWorkload+".json")); bytes.Contains(rec, []byte("hf_s3cr3t")) {
+	if rec, _ := os.ReadFile(filepath.Join(e.dataRoot, "executor", executorWorkload+".json")); bytes.Contains(rec, []byte("hf_s3cr3t")) {
 		t.Errorf("the record holds the secret's value")
 	}
 }
 
 func ptrBool(b bool) *bool { return &b }
 
-func TestDispatchJobStates(t *testing.T) {
-	e := newDispatchEnv(t)
+func TestExecutorJobStates(t *testing.T) {
+	e := newExecutorEnv(t)
 	req := submitRequest(2)
 	req.PodSets[0].Template.Spec.Containers[0].Ports = []v1.ContainerPort{{ContainerPort: 8888}}
 	e.submit(req)
@@ -508,7 +519,7 @@ func TestDispatchJobStates(t *testing.T) {
 	if st.State != JobRunning || st.NodeName != "node07" || strings.Join(st.Nodes, ",") != "node07,node08" || st.StartTime == nil {
 		t.Fatalf("running: %+v", st)
 	}
-	if len(st.Ranks) != 2 || st.Ranks[1].PodUID != memberUID(dispatchWorkload, 1) {
+	if len(st.Ranks) != 2 || st.Ranks[1].PodUID != memberUID(executorWorkload, 1) {
 		t.Fatalf("ranks: %+v", st.Ranks)
 	}
 	if len(e.shadow.ensured) != 1 || e.shadow.ensured[0].NodeName != "node07" || e.shadow.ensured[0].Terminal || e.shadow.ensured[0].WorkloadName != "train" {
@@ -520,7 +531,7 @@ func TestDispatchJobStates(t *testing.T) {
 
 	e.setState("CD None", "0 CD")
 	for i, code := range []string{"0", "3"} {
-		if err := os.WriteFile(e.memberDir(i)+"/run-"+dispatchCtn+".status", []byte(code+"\n"), 0o600); err != nil {
+		if err := os.WriteFile(e.memberDir(i)+"/run-"+executorCtn+".status", []byte(code+"\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -537,7 +548,7 @@ func TestDispatchJobStates(t *testing.T) {
 	}
 }
 
-func TestDispatchJobCompletedAndFailures(t *testing.T) {
+func TestExecutorJobCompletedAndFailures(t *testing.T) {
 	tests := []struct {
 		name, state, exitState, status string
 		gone                           bool
@@ -553,14 +564,14 @@ func TestDispatchJobCompletedAndFailures(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			e := newDispatchEnv(t)
+			e := newExecutorEnv(t)
 			e.submit(submitRequest(1))
 			e.setState(tt.state, tt.exitState)
 			if tt.gone {
 				e.write("gone", "")
 			}
 			if tt.status != "" {
-				if err := os.WriteFile(e.memberDir(0)+"/run-"+dispatchCtn+".status", []byte(tt.status), 0o600); err != nil {
+				if err := os.WriteFile(e.memberDir(0)+"/run-"+executorCtn+".status", []byte(tt.status), 0o600); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -575,19 +586,19 @@ func TestDispatchJobCompletedAndFailures(t *testing.T) {
 	}
 }
 
-func TestDispatchDelete(t *testing.T) {
-	e := newDispatchEnv(t)
+func TestExecutorDelete(t *testing.T) {
+	e := newExecutorEnv(t)
 	e.submit(submitRequest(2))
 	e.setState("R None", "0 R")
 
-	rec := e.do(http.MethodDelete, "/jobs/"+dispatchWorkload, nil)
+	rec := e.do(http.MethodDelete, "/jobs/"+executorWorkload, nil)
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("DELETE = %d %s", rec.Code, rec.Body.String())
 	}
-	if got := strings.TrimSpace(e.read("scancel.calls")); got != dispatchJobID {
-		t.Fatalf("scancel calls %q, want one for %s", got, dispatchJobID)
+	if got := strings.TrimSpace(e.read("scancel.calls")); got != executorJobID {
+		t.Fatalf("scancel calls %q, want one for %s", got, executorJobID)
 	}
-	if len(e.shadow.deleted) != 1 || e.shadow.deleted[0] != dispatchWorkload {
+	if len(e.shadow.deleted) != 1 || e.shadow.deleted[0] != executorWorkload {
 		t.Fatalf("shadow deletes: %v", e.shadow.deleted)
 	}
 	for i := 0; i < 2; i++ {
@@ -595,13 +606,13 @@ func TestDispatchDelete(t *testing.T) {
 			t.Errorf("member %d directory left", i)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(e.dataRoot, "dispatch", dispatchWorkload+".json")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(e.dataRoot, "executor", executorWorkload+".json")); !os.IsNotExist(err) {
 		t.Errorf("record left")
 	}
-	if rec := e.do(http.MethodGet, "/jobs/"+dispatchWorkload, nil); rec.Code != http.StatusNotFound || !decodeError(t, rec).Permanent {
+	if rec := e.do(http.MethodGet, "/jobs/"+executorWorkload, nil); rec.Code != http.StatusNotFound || !decodeError(t, rec).Permanent {
 		t.Fatalf("GET after DELETE = %d %s", rec.Code, rec.Body.String())
 	}
-	if rec := e.do(http.MethodDelete, "/jobs/"+dispatchWorkload, nil); rec.Code != http.StatusNoContent {
+	if rec := e.do(http.MethodDelete, "/jobs/"+executorWorkload, nil); rec.Code != http.StatusNoContent {
 		t.Fatalf("second DELETE = %d", rec.Code)
 	}
 
@@ -609,7 +620,7 @@ func TestDispatchDelete(t *testing.T) {
 	e.submit(submitRequest(1))
 	e.setState("CD None", "0 CD")
 	os.Remove(filepath.Join(e.bin, "scancel.calls"))
-	if rec := e.do(http.MethodDelete, "/jobs/"+dispatchWorkload, nil); rec.Code != http.StatusNoContent {
+	if rec := e.do(http.MethodDelete, "/jobs/"+executorWorkload, nil); rec.Code != http.StatusNoContent {
 		t.Fatalf("DELETE = %d", rec.Code)
 	}
 	if got := e.read("scancel.calls"); got != "" {
@@ -617,9 +628,9 @@ func TestDispatchDelete(t *testing.T) {
 	}
 }
 
-func (e *dispatchEnv) writeLog(i int, content string) {
+func (e *executorEnv) writeLog(i int, content string) {
 	e.t.Helper()
-	f, err := os.OpenFile(e.memberDir(i)+"/run-"+dispatchCtn+".out", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	f, err := os.OpenFile(e.memberDir(i)+"/run-"+executorCtn+".out", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -629,28 +640,28 @@ func (e *dispatchEnv) writeLog(i int, content string) {
 	}
 }
 
-func TestDispatchGetLogs(t *testing.T) {
-	e := newDispatchEnv(t)
+func TestExecutorGetLogs(t *testing.T) {
+	e := newExecutorEnv(t)
 	e.submit(submitRequest(3))
 	for i, text := range []string{"zero a\nzero b\n", "one\n", "two a\ntwo b"} {
 		e.writeLog(i, text)
 	}
 
-	rec := e.do(http.MethodGet, "/getLogs?workloadUID="+dispatchWorkload+"&rank=2", nil)
+	rec := e.do(http.MethodGet, "/getLogs?workloadUID="+executorWorkload+"&rank=2", nil)
 	if rec.Code != http.StatusOK || rec.Body.String() != "two a\ntwo b" {
 		t.Fatalf("rank 2 = %d %q", rec.Code, rec.Body.String())
 	}
 
-	rec = e.do(http.MethodGet, "/getLogs?workloadUID="+dispatchWorkload, nil)
+	rec = e.do(http.MethodGet, "/getLogs?workloadUID="+executorWorkload, nil)
 	want := "[rank 0] zero a\n[rank 0] zero b\n[rank 1] one\n[rank 2] two a\n[rank 2] two b\n"
 	if rec.Code != http.StatusOK || rec.Body.String() != want {
 		t.Fatalf("merged = %d %q, want %q", rec.Code, rec.Body.String(), want)
 	}
-	rec = e.do(http.MethodGet, "/getLogs?workloadUID="+dispatchWorkload+"&tail=2", nil)
+	rec = e.do(http.MethodGet, "/getLogs?workloadUID="+executorWorkload+"&tail=2", nil)
 	if rec.Body.String() != "[rank 2] two a\n[rank 2] two b\n" {
 		t.Fatalf("tail 2 = %q", rec.Body.String())
 	}
-	if rec := e.do(http.MethodGet, "/getLogs?workloadUID="+dispatchWorkload+"&rank=3", nil); rec.Code != http.StatusBadRequest {
+	if rec := e.do(http.MethodGet, "/getLogs?workloadUID="+executorWorkload+"&rank=3", nil); rec.Code != http.StatusBadRequest {
 		t.Fatalf("rank out of range = %d", rec.Code)
 	}
 	if rec := e.do(http.MethodGet, "/getLogs?workloadUID=nope", nil); rec.Code != http.StatusNotFound {
@@ -658,21 +669,21 @@ func TestDispatchGetLogs(t *testing.T) {
 	}
 }
 
-func TestDispatchGetLogsSinglePodHasNoPrefix(t *testing.T) {
-	e := newDispatchEnv(t)
+func TestExecutorGetLogsSinglePodHasNoPrefix(t *testing.T) {
+	e := newExecutorEnv(t)
 	e.submit(submitRequest(1))
 	e.writeLog(0, "hello\n")
-	if rec := e.do(http.MethodGet, "/getLogs?workloadUID="+dispatchWorkload, nil); rec.Body.String() != "hello\n" {
+	if rec := e.do(http.MethodGet, "/getLogs?workloadUID="+executorWorkload, nil); rec.Body.String() != "hello\n" {
 		t.Fatalf("single member = %q", rec.Body.String())
 	}
 }
 
-func TestDispatchGetLogsFollow(t *testing.T) {
+func TestExecutorGetLogsFollow(t *testing.T) {
 	oldPoll, oldQuiet := logsPollInterval, logsDrainQuiet
 	logsPollInterval, logsDrainQuiet = 10*time.Millisecond, 200*time.Millisecond
 	t.Cleanup(func() { logsPollInterval, logsDrainQuiet = oldPoll, oldQuiet })
 
-	e := newDispatchEnv(t)
+	e := newExecutorEnv(t)
 	e.submit(submitRequest(2))
 	e.writeLog(0, "first\n")
 	srv := httptest.NewServer(e.mux)
@@ -680,7 +691,7 @@ func TestDispatchGetLogsFollow(t *testing.T) {
 
 	done := make(chan string)
 	go func() {
-		resp, err := http.Get(srv.URL + "/getLogs?workloadUID=" + dispatchWorkload + "&follow=true")
+		resp, err := http.Get(srv.URL + "/getLogs?workloadUID=" + executorWorkload + "&follow=true")
 		if err != nil {
 			done <- "error: " + err.Error()
 			return
@@ -702,7 +713,7 @@ func TestDispatchGetLogsFollow(t *testing.T) {
 	}
 	e.writeLog(1, " line\nlast")
 	for i := 0; i < 2; i++ {
-		if err := os.WriteFile(e.memberDir(i)+"/run-"+dispatchCtn+".status", []byte("0"), 0o600); err != nil {
+		if err := os.WriteFile(e.memberDir(i)+"/run-"+executorCtn+".status", []byte("0"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -720,15 +731,15 @@ func TestDispatchGetLogsFollow(t *testing.T) {
 	}
 }
 
-func TestDispatchTokenReview(t *testing.T) {
-	e := newDispatchEnv(t)
-	e.d.Sidecar.Config.Dispatch.Auth = DispatchAuthConfig{Mode: DispatchAuthTokenReview, Audience: "interlink-agent", AllowedServiceAccounts: []string{dispatchSA}}
+func TestExecutorTokenReview(t *testing.T) {
+	e := newExecutorEnv(t)
+	e.d.Sidecar.Config.Executor.Auth = ExecutorAuthConfig{Mode: ExecutorAuthTokenReview, Audience: "kueue-offload-executor", AllowedServiceAccounts: []string{executorSA}}
 	reviews := 0
 	e.kube.PrependReactor("create", "tokenreviews", func(a k8stesting.Action) (bool, runtime.Object, error) {
 		reviews++
 		tr := a.(k8stesting.CreateAction).GetObject().(*authv1.TokenReview)
-		user := map[string]string{"good": dispatchSA, "other": "system:serviceaccount:bob:intruder"}[tr.Spec.Token]
-		if len(tr.Spec.Audiences) != 1 || tr.Spec.Audiences[0] != "interlink-agent" {
+		user := map[string]string{"good": executorSA, "other": "system:serviceaccount:bob:intruder"}[tr.Spec.Token]
+		if len(tr.Spec.Audiences) != 1 || tr.Spec.Audiences[0] != "kueue-offload-executor" {
 			user = ""
 		}
 		tr.Status = authv1.TokenReviewStatus{Authenticated: user != "", User: authv1.UserInfo{Username: user}, Audiences: tr.Spec.Audiences}
@@ -745,7 +756,7 @@ func TestDispatchTokenReview(t *testing.T) {
 	if rec.Code != http.StatusForbidden || decodeError(t, rec).Permanent {
 		t.Fatalf("token of another user = %d %s", rec.Code, rec.Body.String())
 	}
-	if rec := e.do(http.MethodGet, "/jobs/"+dispatchWorkload, nil, "Authorization", "Bearer other"); rec.Code != http.StatusForbidden {
+	if rec := e.do(http.MethodGet, "/jobs/"+executorWorkload, nil, "Authorization", "Bearer other"); rec.Code != http.StatusForbidden {
 		t.Fatalf("GET /jobs with another user's token = %d", rec.Code)
 	}
 	if s := e.read("sbatch.scripts"); s != "" {
@@ -753,10 +764,10 @@ func TestDispatchTokenReview(t *testing.T) {
 	}
 
 	if rec := e.do(http.MethodPost, "/submit", submitRequest(1), "Authorization", "Bearer good"); rec.Code != http.StatusCreated {
-		t.Fatalf("dispatcher's token = %d %s", rec.Code, rec.Body.String())
+		t.Fatalf("offload controller's token = %d %s", rec.Code, rec.Body.String())
 	}
 	before := reviews
-	if rec := e.do(http.MethodGet, "/jobs/"+dispatchWorkload, nil, "Authorization", "Bearer good"); rec.Code != http.StatusOK {
+	if rec := e.do(http.MethodGet, "/jobs/"+executorWorkload, nil, "Authorization", "Bearer good"); rec.Code != http.StatusOK {
 		t.Fatalf("GET /jobs = %d %s", rec.Code, rec.Body.String())
 	}
 	if reviews != before {
@@ -767,8 +778,8 @@ func TestDispatchTokenReview(t *testing.T) {
 	}
 }
 
-func TestDispatchGetLogsWithoutWorkloadIsThePodPath(t *testing.T) {
-	e := newDispatchEnv(t)
+func TestExecutorGetLogsWithoutWorkloadIsThePodPath(t *testing.T) {
+	e := newExecutorEnv(t)
 	dir := e.dataRoot + "default-pod-uid"
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
@@ -788,7 +799,7 @@ func TestDispatchGetLogsWithoutWorkloadIsThePodPath(t *testing.T) {
 func TestMemberSocketDirsDiffer(t *testing.T) {
 	seen := map[string]int{}
 	for i := 0; i < 12; i++ {
-		dir := socketDirFor(socketTestRoot, memberUID(dispatchWorkload, i))
+		dir := socketDirFor(socketTestRoot, memberUID(executorWorkload, i))
 		if dir == "" {
 			t.Fatalf("member %d has no socket directory", i)
 		}
@@ -800,12 +811,12 @@ func TestMemberSocketDirsDiffer(t *testing.T) {
 			t.Fatalf("member %d: %s is not 12 characters under the root", i, dir)
 		}
 	}
-	if got := socketDirFor(socketTestRoot, dispatchWorkload); got != socketTestRoot+"/0b6c1d2e3f40" {
+	if got := socketDirFor(socketTestRoot, executorWorkload); got != socketTestRoot+"/0b6c1d2e3f40" {
 		t.Fatalf("a pod UID's directory changed: %s", got)
 	}
 }
 
-func TestValidateDispatchConfig(t *testing.T) {
+func TestValidateExecutorConfig(t *testing.T) {
 	for _, k := range []string{"REMOTE_USER", "REMOTE_LOGIN", "REMOTE_PORT", "SSH_KEY"} {
 		t.Setenv(k, "")
 	}
@@ -820,19 +831,19 @@ func TestValidateDispatchConfig(t *testing.T) {
 	base := func() SlurmConfig {
 		return SlurmConfig{
 			DataRootFolder: "/data/",
-			Dispatch:       DispatchConfig{Enabled: true, Auth: DispatchAuthConfig{AllowedServiceAccounts: []string{dispatchSA}}},
-			Sites: map[string]SiteConfig{dispatchSite: {
+			Executor:       ExecutorConfig{Enabled: true, Auth: ExecutorAuthConfig{AllowedServiceAccounts: []string{executorSA}}},
+			Sites: map[string]SiteConfig{executorSite: {
 				LoginHost: "login.hpc-a.example.org", User: "alice", KeyFile: "/etc/interlink/keys/hpc-a/ssh-privatekey",
-				AllowedAccounts: []string{dispatchAccount},
+				AllowedAccounts: []string{executorAccount},
 			}},
 		}
 	}
 	c := base()
-	if err := validateDispatchConfig(&c); err != nil {
+	if err := validateExecutorConfig(&c); err != nil {
 		t.Fatal(err)
 	}
-	if c.Dispatch.Namespace != "alice" || c.Dispatch.StateDir != "/data/dispatch" || c.Dispatch.Auth.Mode != DispatchAuthTokenReview || c.Dispatch.Auth.Audience != "interlink-agent" || !c.GangSchedulingEnabled {
-		t.Fatalf("defaults: %+v", c.Dispatch)
+	if c.Executor.Namespace != "alice" || c.Executor.StateDir != "/data/executor" || c.Executor.Auth.Mode != ExecutorAuthTokenReview || c.Executor.Auth.Audience != "kueue-offload-executor" || !c.GangSchedulingEnabled {
+		t.Fatalf("defaults: %+v", c.Executor)
 	}
 	for k, want := range map[string]string{"REMOTE_USER": "alice", "REMOTE_LOGIN": "login.hpc-a.example.org", "REMOTE_PORT": "22", "SSH_KEY": "/etc/interlink/keys/hpc-a/ssh-privatekey"} {
 		if got := os.Getenv(k); got != want {
@@ -841,27 +852,52 @@ func TestValidateDispatchConfig(t *testing.T) {
 	}
 
 	bad := map[string]func(*SlurmConfig){
-		"two sites": func(c *SlurmConfig) { c.Sites["hpc-b"] = c.Sites[dispatchSite] },
+		"two sites": func(c *SlurmConfig) { c.Sites["hpc-b"] = c.Sites[executorSite] },
 		"no sites":  func(c *SlurmConfig) { c.Sites = nil },
 		"no accounts": func(c *SlurmConfig) {
-			s := c.Sites[dispatchSite]
+			s := c.Sites[executorSite]
 			s.AllowedAccounts = nil
-			c.Sites[dispatchSite] = s
+			c.Sites[executorSite] = s
 		},
-		"tokenreview without callers": func(c *SlurmConfig) { c.Dispatch.Auth.AllowedServiceAccounts = nil },
-		"unknown auth mode":           func(c *SlurmConfig) { c.Dispatch.Auth.Mode = "basic" },
+		"tokenreview without callers": func(c *SlurmConfig) { c.Executor.Auth.AllowedServiceAccounts = nil },
+		"unknown auth mode":           func(c *SlurmConfig) { c.Executor.Auth.Mode = "basic" },
 		"shadow without key":          func(c *SlurmConfig) { c.Shadow.Enabled = true },
 	}
 	for name, mutate := range bad {
 		c := base()
 		mutate(&c)
-		if err := validateDispatchConfig(&c); err == nil {
+		if err := validateExecutorConfig(&c); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
 	}
 
 	off := SlurmConfig{Sites: map[string]SiteConfig{"a": {}, "b": {}}}
-	if err := validateDispatchConfig(&off); err != nil {
-		t.Errorf("Dispatch off must not be validated: %v", err)
+	if err := validateExecutorConfig(&off); err != nil {
+		t.Errorf("Executor off must not be validated: %v", err)
+	}
+}
+
+// Two containers of one pod mount the same volume: the second rewrites the folder the
+// first wrote, without removing it, and a key the data no longer has goes.
+func TestRemoveStaleFilesKeepsTheFolder(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "projectedVolumeMaps", "kube-api-access")
+	if err := os.MkdirAll(filepath.Join(dir, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"token", "namespace", "old", "sub/a"} {
+		if err := os.WriteFile(filepath.Join(dir, f), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := removeStaleFiles(dir, map[string][]byte{"token": nil, "namespace": nil, "sub/a": nil}); err != nil {
+		t.Fatal(err)
+	}
+	for f, want := range map[string]bool{"token": true, "namespace": true, "sub/a": true, "old": false} {
+		if _, err := os.Stat(filepath.Join(dir, f)); (err == nil) != want {
+			t.Errorf("%s present: %v, want %v", f, err == nil, want)
+		}
+	}
+	if err := removeStaleFiles(filepath.Join(dir, "missing"), nil); err != nil {
+		t.Errorf("a folder that does not exist yet: %v", err)
 	}
 }

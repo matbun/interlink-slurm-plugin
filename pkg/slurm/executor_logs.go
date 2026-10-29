@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -29,12 +30,12 @@ var logsDrainQuiet = 10 * time.Second
 // GetLogsHandler is /getLogs. With workloadUID in the query it answers with the
 // workload's logs; without, it is the plugin's per-pod /getLogs.
 //
-// Query: workloadUID, container (default: the first container), rank, follow,
-// tail, sinceSeconds. With rank, that member's log as the per-pod path reads it.
-// Without rank, every member's lines, prefixed "[rank N] " when there are more
-// than one: rank by rank, or as they appear with follow, until the job ended
-// and every file is drained.
-func (d *Dispatcher) GetLogsHandler(w http.ResponseWriter, r *http.Request) {
+// Query: workloadUID, container (default: each member's first container), rank,
+// follow, tail, sinceSeconds. With rank, that member's log as the per-pod path
+// reads it. Without rank, the lines of every member that has the container,
+// prefixed "[rank N] " when there are more than one member: rank by rank, or as
+// they appear with follow, until the job ended and every file is drained.
+func (d *Executor) GetLogsHandler(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	if !q.Has("workloadUID") {
 		d.Sidecar.GetLogsHandler(w, r)
@@ -47,20 +48,7 @@ func (d *Dispatcher) GetLogsHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no job for workload "+uid, http.StatusNotFound)
 		return
 	}
-	ps := rec.Request.PodSets[0]
 	container := q.Get("container")
-	if container == "" {
-		container = ps.Template.Spec.Containers[0].Name
-	}
-	isInit := false
-	switch {
-	case hasContainer(ps.Template.Spec.Containers, container):
-	case hasContainer(ps.Template.Spec.InitContainers, container):
-		isInit = true
-	default:
-		http.Error(w, "no container "+container+" in workload "+uid, http.StatusBadRequest)
-		return
-	}
 	intParam := func(name string) (int, bool) {
 		raw := q.Get(name)
 		if raw == "" {
@@ -83,6 +71,11 @@ func (d *Dispatcher) GetLogsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	follow := q.Get("follow") == "true"
 	members := memberPods(rec)
+	logs := memberLogs(members, container)
+	if len(logs) == 0 {
+		http.Error(w, "no container "+container+" in workload "+uid, http.StatusBadRequest)
+		return
+	}
 
 	if q.Has("rank") {
 		rank, ok := intParam("rank")
@@ -93,19 +86,24 @@ func (d *Dispatcher) GetLogsHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf("rank %d: workload %s has %d member(s)", rank, uid, len(members)), http.StatusBadRequest)
 			return
 		}
-		m := members[rank]
+		i := slices.IndexFunc(logs, func(l memberLog) bool { return l.rank == rank })
+		if i < 0 {
+			http.Error(w, fmt.Sprintf("rank %d of workload %s has no container %s", rank, uid, container), http.StatusBadRequest)
+			return
+		}
+		m := logs[i].pod
 		req := commonIL.LogStruct{
 			Namespace:     m.Namespace,
 			PodUID:        string(m.UID),
 			PodName:       m.Name,
-			ContainerName: container,
+			ContainerName: logs[i].container,
 			Opts:          commonIL.ContainerLogOpts{Tail: tail, Follow: follow, SinceSeconds: since},
 		}
 		d.Sidecar.getLogs(r.Context(), start, req, w, r, GetSessionContext(r))
 		return
 	}
 
-	sources := d.logSources(members, container, isInit)
+	sources := d.logSources(logs, len(members) > 1)
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusOK)
 	flush := func() {
@@ -118,7 +116,7 @@ func (d *Dispatcher) GetLogsHandler(w http.ResponseWriter, r *http.Request) {
 	for _, s := range sources {
 		out, err := s.readNew(!follow)
 		if err != nil {
-			log.G(d.Sidecar.Ctx).Warning("dispatch: logs of workload ", uid, ": ", err)
+			log.G(d.Sidecar.Ctx).Warning("executor: logs of workload ", uid, ": ", err)
 		}
 		first.Write(out)
 	}
@@ -141,12 +139,12 @@ func (d *Dispatcher) GetLogsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		// Checked before reading: whatever the job wrote before it ended is read
 		// in this pass.
-		ended := d.logsEnded(uid, members, container, isInit)
+		ended := d.logsEnded(uid, logs)
 		wrote := false
 		for _, s := range sources {
 			out, err := s.readNew(ended)
 			if err != nil {
-				log.G(d.Sidecar.Ctx).Warning("dispatch: logs of workload ", uid, ": ", err)
+				log.G(d.Sidecar.Ctx).Warning("executor: logs of workload ", uid, ": ", err)
 				continue
 			}
 			if len(out) == 0 {
@@ -180,6 +178,42 @@ func hasContainer(list []v1.Container, name string) bool {
 	return false
 }
 
+// memberLog is the log of one container of one member.
+type memberLog struct {
+	rank      int
+	pod       *v1.Pod
+	container string
+	isInit    bool
+}
+
+// memberLogs lists the members that have the container, or every member's first
+// container when none is named: members of different PodSets can have different
+// containers.
+func memberLogs(members []*v1.Pod, container string) []memberLog {
+	var logs []memberLog
+	for i, m := range members {
+		l := memberLog{rank: i, pod: m, container: container}
+		switch {
+		case container == "":
+			l.container = m.Spec.Containers[0].Name
+		case hasContainer(m.Spec.Containers, container):
+		case hasContainer(m.Spec.InitContainers, container):
+			l.isInit = true
+		default:
+			continue
+		}
+		logs = append(logs, l)
+	}
+	return logs
+}
+
+func (l memberLog) kind() string {
+	if l.isInit {
+		return "init-"
+	}
+	return "run-"
+}
+
 // logSource is one log file of one member, read from where the last read ended.
 type logSource struct {
 	prefix  string
@@ -189,22 +223,19 @@ type logSource struct {
 }
 
 // logSources lists, rank by rank, the files the per-pod log path reads: the
-// member's job.out, then its container's output.
-func (d *Dispatcher) logSources(members []*v1.Pod, container string, isInit bool) []*logSource {
-	kind := "run-"
-	if isInit {
-		kind = "init-"
-	}
+// member's job.out, then its container's output. With prefix each line names its
+// rank.
+func (d *Executor) logSources(logs []memberLog, prefix bool) []*logSource {
 	var sources []*logSource
-	for i, m := range members {
-		prefix := ""
-		if len(members) > 1 {
-			prefix = "[rank " + strconv.Itoa(i) + "] "
+	for _, l := range logs {
+		p := ""
+		if prefix {
+			p = "[rank " + strconv.Itoa(l.rank) + "] "
 		}
-		_, workDir := d.memberDirs(m)
+		_, workDir := d.memberDirs(l.pod)
 		sources = append(sources,
-			&logSource{prefix: prefix, path: workDir + "/job.out"},
-			&logSource{prefix: prefix, path: workDir + "/" + kind + container + ".out"},
+			&logSource{prefix: p, path: workDir + "/job.out"},
+			&logSource{prefix: p, path: workDir + "/" + l.kind() + l.container + ".out"},
 		)
 	}
 	return sources
@@ -273,7 +304,7 @@ func lastLines(text []byte, n int) []byte {
 // logsEnded reports whether a followed log has nothing more to come: the
 // workload is gone, GET /jobs saw its job end, or every member's container
 // wrote its exit status.
-func (d *Dispatcher) logsEnded(uid string, members []*v1.Pod, container string, isInit bool) bool {
+func (d *Executor) logsEnded(uid string, logs []memberLog) bool {
 	d.mu.Lock()
 	rec := d.records[uid]
 	ended := rec == nil || rec.Terminal != ""
@@ -281,13 +312,9 @@ func (d *Dispatcher) logsEnded(uid string, members []*v1.Pod, container string, 
 	if ended {
 		return true
 	}
-	kind := "run-"
-	if isInit {
-		kind = "init-"
-	}
-	for _, m := range members {
-		_, workDir := d.memberDirs(m)
-		if _, err := os.Stat(workDir + "/" + kind + container + ".status"); err != nil {
+	for _, l := range logs {
+		_, workDir := d.memberDirs(l.pod)
+		if _, err := os.Stat(workDir + "/" + l.kind() + l.container + ".status"); err != nil {
 			return false
 		}
 	}

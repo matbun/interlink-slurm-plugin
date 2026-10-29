@@ -47,14 +47,39 @@ func memberUID(workloadUID string, i int) string {
 	return workloadUID + "-" + strconv.Itoa(i)
 }
 
-// buildMember returns member i of the request's only PodSet as the pod the
-// create path takes: named after the owner, labelled with its completion index,
-// with the site's account and partition among its sbatch flags. A workload of
-// more than one member is a Kueue pod group of that size, member 0 its head.
-// References are not resolved here.
+// PodSetAnnotation names the PodSet a member comes from.
+const PodSetAnnotation = "interlink.eu/podset"
+
+// workloadMembers is the number of members of the request: every PodSet's count.
+func workloadMembers(req SubmitRequest) int {
+	n := 0
+	for _, ps := range req.PodSets {
+		n += int(ps.Count)
+	}
+	return n
+}
+
+// memberPodSet returns the index of the PodSet member i comes from. Members are
+// numbered across the PodSets in request order.
+func memberPodSet(req SubmitRequest, i int) int {
+	for p, ps := range req.PodSets {
+		if i < int(ps.Count) {
+			return p
+		}
+		i -= int(ps.Count)
+	}
+	return -1
+}
+
+// buildMember returns member i of the request as the pod the create path takes:
+// its own PodSet's template, named after the owner, labelled with its completion
+// index within the whole workload, with the site's account and partition among
+// its sbatch flags. A workload of more than one member is a Kueue pod group of
+// that size, member 0 (of the first PodSet) its head. References are not
+// resolved here.
 func buildMember(req SubmitRequest, i int) *v1.Pod {
-	ps := req.PodSets[0]
-	count := int(ps.Count)
+	ps := req.PodSets[memberPodSet(req, i)]
+	count := workloadMembers(req)
 	tmpl := ps.Template.DeepCopy()
 
 	labels := map[string]string{}
@@ -72,6 +97,7 @@ func buildMember(req SubmitRequest, i int) *v1.Pod {
 		delete(annotations, k)
 	}
 	labels[JobCompletionIndexLabel] = strconv.Itoa(i)
+	annotations[PodSetAnnotation] = ps.Name
 	if count > 1 {
 		labels[PodGroupNameLabel] = req.WorkloadUID
 		annotations[PodGroupTotalCountAnnotation] = strconv.Itoa(count)
@@ -84,6 +110,9 @@ func buildMember(req SubmitRequest, i int) *v1.Pod {
 	flags := strings.TrimSpace(annotations[slurmFlagsAnnotation] + " --account=" + req.Account)
 	if ps.Partition != "" {
 		flags += " --partition=" + ps.Partition
+	}
+	if ps.QOS != "" {
+		flags += " --qos=" + ps.QOS
 	}
 	annotations[slurmFlagsAnnotation] = flags
 
@@ -128,6 +157,15 @@ func buildMember(req SubmitRequest, i int) *v1.Pod {
 			src.DownwardAPI.DefaultMode = ptrInt32(defaultVolumeMode)
 		}
 	}
+	// A workload of one plain pod is that pod: its downward API names it, as a workflow
+	// engine's executor (Argo's) addresses its own pod by name and UID through the API
+	// server, and an owner reference to a UID that does not exist is garbage collected.
+	if count == 1 && req.Owner.Kind == "Pod" && req.Owner.Name != "" {
+		pod.Name = req.Owner.Name
+		if req.Owner.UID != "" {
+			pod.Annotations[DownwardUIDAnnotation] = req.Owner.UID
+		}
+	}
 	return pod
 }
 
@@ -143,6 +181,72 @@ func requestsAsLimits(r *v1.ResourceRequirements) {
 			r.Limits = v1.ResourceList{}
 		}
 		r.Limits[name] = q.DeepCopy()
+	}
+}
+
+// serviceAccountDir is where the API server mounts a pod's ServiceAccount files.
+const serviceAccountDir = "/var/run/secrets/kubernetes.io/serviceaccount"
+
+// withServiceAccountDir does for a PodSet template what the API server's
+// ServiceAccount admission does for a pod, since the workload's pods never exist:
+// unless the template opts out or mounts the directory itself, every container gets
+// /var/run/secrets/kubernetes.io/serviceaccount with namespace and ca.crt, and the
+// token when token is true. Clients read their namespace there (Katib's SDK does).
+func withServiceAccountDir(ps *ExecutorPodSet, token bool) {
+	spec := &ps.Template.Spec
+	if spec.AutomountServiceAccountToken != nil && !*spec.AutomountServiceAccountToken {
+		return
+	}
+	for _, list := range [][]v1.Container{spec.InitContainers, spec.Containers} {
+		for _, c := range list {
+			for _, m := range c.VolumeMounts {
+				if m.MountPath == serviceAccountDir {
+					return
+				}
+			}
+		}
+	}
+	const name = "kube-api-access-interlink"
+	var sources []v1.VolumeProjection
+	if token {
+		expiration := int64(3607)
+		sources = append(sources, v1.VolumeProjection{ServiceAccountToken: &v1.ServiceAccountTokenProjection{Path: "token", ExpirationSeconds: &expiration}})
+	}
+	sources = append(sources,
+		v1.VolumeProjection{ConfigMap: &v1.ConfigMapProjection{LocalObjectReference: v1.LocalObjectReference{Name: "kube-root-ca.crt"}, Items: []v1.KeyToPath{{Key: "ca.crt", Path: "ca.crt"}}}},
+		v1.VolumeProjection{DownwardAPI: &v1.DownwardAPIProjection{Items: []v1.DownwardAPIVolumeFile{{Path: "namespace", FieldRef: &v1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}}}},
+	)
+	spec.Volumes = append(spec.Volumes, v1.Volume{Name: name, VolumeSource: v1.VolumeSource{Projected: &v1.ProjectedVolumeSource{Sources: sources}}})
+	for _, list := range [][]v1.Container{spec.InitContainers, spec.Containers} {
+		for c := range list {
+			list[c].VolumeMounts = append(list[c].VolumeMounts, v1.VolumeMount{Name: name, MountPath: serviceAccountDir, ReadOnly: true})
+		}
+	}
+	if !slices.Contains(ps.ConfigMapRefs, "kube-root-ca.crt") {
+		ps.ConfigMapRefs = append(ps.ConfigMapRefs, "kube-root-ca.crt")
+	}
+}
+
+// DownwardUIDAnnotation carries the UID a member's downward API reports when it is not
+// the member's own (see buildMember).
+const DownwardUIDAnnotation = "interlink.eu/downward-uid"
+
+// withKubernetesAPI gives every container the API server's address, as the kubelet
+// does, unless the container sets it itself.
+func withKubernetesAPI(pod *v1.Pod, api ExecutorKubernetesAPI) {
+	vars := []v1.EnvVar{
+		{Name: "KUBERNETES_SERVICE_HOST", Value: api.Host},
+		{Name: "KUBERNETES_SERVICE_PORT", Value: api.Port},
+		{Name: "KUBERNETES_SERVICE_PORT_HTTPS", Value: api.Port},
+	}
+	for _, list := range [][]v1.Container{pod.Spec.InitContainers, pod.Spec.Containers} {
+		for c := range list {
+			for _, v := range vars {
+				if !slices.ContainsFunc(list[c].Env, func(e v1.EnvVar) bool { return e.Name == v.Name }) {
+					list[c].Env = append(list[c].Env, v)
+				}
+			}
+		}
 	}
 }
 
@@ -169,7 +273,7 @@ func tokenKey(volume, path string) string { return volume + "/" + path }
 // for the pod's ServiceAccount, with the projection's audience and lifetime. A
 // template without one makes no request. The tokens are not bound to a pod: the
 // workload's pods never exist.
-func (d *Dispatcher) mintTokens(ctx context.Context, namespace string, spec v1.PodSpec) (map[string]string, *apiError) {
+func (d *Executor) mintTokens(ctx context.Context, namespace string, spec v1.PodSpec) (map[string]string, *apiError) {
 	tokens := map[string]string{}
 	account := spec.ServiceAccountName
 	if account == "" {
@@ -185,7 +289,7 @@ func (d *Dispatcher) mintTokens(ctx context.Context, namespace string, spec v1.P
 				continue
 			}
 			if d.Kube == nil {
-				return nil, transientError("the agent has no Kubernetes client to request a token for ServiceAccount %q", account)
+				return nil, transientError("the executor has no Kubernetes client to request a token for ServiceAccount %q", account)
 			}
 			expiration := defaultTokenExpirationSeconds
 			if p.ExpirationSeconds != nil {
@@ -262,9 +366,9 @@ func templateRefs(spec v1.PodSpec) (secrets, configMaps map[string]bool) {
 }
 
 // fetchRefs reads the PodSet's secretRefs and configMapRefs, and only those,
-// from the agent's namespace. A reference of the template that the lists leave
-// out, or a required one the agent cannot read, is a permanent refusal.
-func (d *Dispatcher) fetchRefs(ctx context.Context, namespace string, ps DispatchPodSet) (podRefs, *apiError) {
+// from the executor's namespace. A reference of the template that the lists leave
+// out, or a required one the executor cannot read, is a permanent refusal.
+func (d *Executor) fetchRefs(ctx context.Context, namespace string, ps ExecutorPodSet) (podRefs, *apiError) {
 	refs := podRefs{secrets: map[string]*v1.Secret{}, configMaps: map[string]*v1.ConfigMap{}}
 	usedSecrets, usedConfigMaps := templateRefs(ps.Template.Spec)
 	for name := range usedSecrets {
@@ -278,7 +382,7 @@ func (d *Dispatcher) fetchRefs(ctx context.Context, namespace string, ps Dispatc
 		}
 	}
 	if len(ps.SecretRefs)+len(ps.ConfigMapRefs) > 0 && d.Kube == nil {
-		return refs, transientError("the agent has no Kubernetes client to read the workload's references")
+		return refs, transientError("the executor has no Kubernetes client to read the workload's references")
 	}
 
 	readErr := func(kind, name string, required bool, err error) *apiError {
@@ -323,7 +427,7 @@ func (d *Dispatcher) fetchRefs(ctx context.Context, namespace string, ps Dispatc
 var metadataFieldRefPattern = regexp.MustCompile(`^metadata\.(labels|annotations)\[['"]?(.+?)['"]?\]$`)
 
 // fieldRefValue resolves a fieldRef as the kubelet would for this pod. ok is
-// false for a path the agent cannot know.
+// false for a path the executor cannot know.
 func fieldRefValue(pod *v1.Pod, path string) (string, bool) {
 	switch path {
 	case "metadata.name":
@@ -331,6 +435,9 @@ func fieldRefValue(pod *v1.Pod, path string) (string, bool) {
 	case "metadata.namespace":
 		return pod.Namespace, true
 	case "metadata.uid":
+		if uid := pod.Annotations[DownwardUIDAnnotation]; uid != "" {
+			return uid, true
+		}
 		return string(pod.UID), true
 	case "spec.serviceAccountName":
 		return pod.Spec.ServiceAccountName, true
@@ -445,7 +552,7 @@ func envFromSource(pod *v1.Pod, container *v1.Container, e v1.EnvVar, refs podRe
 	case src.FieldRef != nil:
 		v, ok := fieldRefValue(pod, src.FieldRef.FieldPath)
 		if !ok {
-			log.G(context.Background()).Warningf("dispatch: container %s, env %s: fieldRef %s is unknown outside a node, left empty", container.Name, e.Name, src.FieldRef.FieldPath)
+			log.G(context.Background()).Warningf("executor: container %s, env %s: fieldRef %s is unknown outside a node, left empty", container.Name, e.Name, src.FieldRef.FieldPath)
 		}
 		return v, true, nil
 	case src.ResourceFieldRef != nil:

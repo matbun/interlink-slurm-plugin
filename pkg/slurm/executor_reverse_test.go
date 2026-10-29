@@ -22,11 +22,11 @@ import (
 
 const reverseTarget = "mlflow.alice.svc.cluster.local"
 
-// reverseEnv is an agent whose shadows are rendered by the real shadow manager
+// reverseEnv is an executor whose shadows are rendered by the real shadow manager
 // on a fake cluster, with the reverse tunnel enabled.
-func reverseEnv(t *testing.T, reverse shadow.ReverseConfig) *dispatchEnv {
+func reverseEnv(t *testing.T, reverse shadow.ReverseConfig) *executorEnv {
 	t.Helper()
-	e := newDispatchEnv(t)
+	e := newExecutorEnv(t)
 	e.d.Sidecar.Config.SocketDirRoot = socketTestRoot
 	e.d.Sidecar.Config.Shadow = shadowBlock()
 	e.d.Sidecar.Config.Shadow.Reverse = reverse
@@ -46,7 +46,7 @@ func reverseRequest(count int32, forwards string) SubmitRequest {
 
 // The head rank runs the tunnel's set-up on the node the shadow reaches, the
 // other ranks do not, and the shadow carries the ssh-reverse container.
-func TestDispatchReverseTunnel(t *testing.T) {
+func TestExecutorReverseTunnel(t *testing.T) {
 	e := reverseEnv(t, shadow.ReverseConfig{Enabled: true, AllowedTargets: []string{reverseTarget + ":5000"}})
 	e.submit(reverseRequest(2, reverseTarget+":5000"))
 
@@ -56,7 +56,7 @@ func TestDispatchReverseTunnel(t *testing.T) {
 		t.Fatalf("no rank 1 in the gang script\n%s", scripts)
 	}
 	names := reverseTarget + " mlflow.alice.svc mlflow.alice mlflow"
-	for _, want := range []string{"interLink reverse tunnel", names, "rev-relay.py", "export INTERLINK_SOCKET_DIR=" + socketDirFor(socketTestRoot, memberUID(dispatchWorkload, 0))} {
+	for _, want := range []string{"interLink reverse tunnel", names, "rev-relay.py", "export INTERLINK_SOCKET_DIR=" + socketDirFor(socketTestRoot, memberUID(executorWorkload, 0))} {
 		if !strings.Contains(head, want) {
 			t.Errorf("rank 0 lacks %q\n%s", want, head)
 		}
@@ -84,7 +84,7 @@ func TestDispatchReverseTunnel(t *testing.T) {
 	if st.State != JobRunning || st.Shadow == nil || st.Shadow.Service != "" {
 		t.Fatalf("running: state %s, shadow %+v", st.State, st.Shadow)
 	}
-	dep, err := e.kube.AppsV1().Deployments(dispatchNS).Get(context.Background(), st.Shadow.Deployment, metav1.GetOptions{})
+	dep, err := e.kube.AppsV1().Deployments(executorNS).Get(context.Background(), st.Shadow.Deployment, metav1.GetOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,16 +95,16 @@ func TestDispatchReverseTunnel(t *testing.T) {
 	for _, ev := range dep.Spec.Template.Spec.Containers[0].Env {
 		env[ev.Name] = ev.Value
 	}
-	if env["REV_FORWARDS"] != "5000:"+reverseTarget+":5000" || env["REV_JOB_NAME"] != dispatchWorkload {
+	if env["REV_FORWARDS"] != "5000:"+reverseTarget+":5000" || env["REV_JOB_NAME"] != executorWorkload {
 		t.Errorf("ssh-reverse env %v", env)
 	}
-	cm, err := e.kube.CoreV1().ConfigMaps(dispatchNS).Get(context.Background(), st.Shadow.NodeConfigMap, metav1.GetOptions{})
-	if err != nil || cm.Data["compute-node"] != "node07" || cm.Data["socket-dir"] != socketDirFor(socketTestRoot, memberUID(dispatchWorkload, 0)) {
+	cm, err := e.kube.CoreV1().ConfigMaps(executorNS).Get(context.Background(), st.Shadow.NodeConfigMap, metav1.GetOptions{})
+	if err != nil || cm.Data["compute-node"] != "node07" || cm.Data["socket-dir"] != socketDirFor(socketTestRoot, memberUID(executorWorkload, 0)) {
 		t.Fatalf("node ConfigMap %v (%v): the tunnel must end in the head's socket directory", cm, err)
 	}
 }
 
-func TestDispatchReverseSinglePod(t *testing.T) {
+func TestExecutorReverseSinglePod(t *testing.T) {
 	e := reverseEnv(t, shadow.ReverseConfig{Enabled: true})
 	e.submit(reverseRequest(1, "8443:"+reverseTarget+":443"))
 	scripts := e.read("sbatch.scripts")
@@ -114,7 +114,7 @@ func TestDispatchReverseSinglePod(t *testing.T) {
 	}
 }
 
-func TestDispatchReverseRefusals(t *testing.T) {
+func TestExecutorReverseRefusals(t *testing.T) {
 	enabled := shadow.ReverseConfig{Enabled: true}
 	tests := []struct {
 		name    string
@@ -153,15 +153,15 @@ func TestDispatchReverseRefusals(t *testing.T) {
 	}
 }
 
-func TestValidateDispatchConfigChecksReverse(t *testing.T) {
-	t.Setenv(shadow.AgentImageEnv, "")
+func TestValidateExecutorConfigChecksReverse(t *testing.T) {
+	t.Setenv(shadow.ExecutorImageEnv, "")
 	base := func() SlurmConfig {
 		c := SlurmConfig{
 			DataRootFolder: "/data/",
 			SocketDirRoot:  socketTestRoot,
-			Dispatch:       DispatchConfig{Enabled: true, Namespace: dispatchNS, Auth: DispatchAuthConfig{Mode: DispatchAuthNetwork}},
-			Sites: map[string]SiteConfig{dispatchSite: {
-				LoginHost: "login.hpc-a.example.org", User: "alice", AllowedAccounts: []string{dispatchAccount},
+			Executor:       ExecutorConfig{Enabled: true, Namespace: executorNS, Auth: ExecutorAuthConfig{Mode: ExecutorAuthNetwork}},
+			Sites: map[string]SiteConfig{executorSite: {
+				LoginHost: "login.hpc-a.example.org", User: "alice", AllowedAccounts: []string{executorAccount},
 			}},
 			Shadow: shadowBlock(),
 		}
@@ -169,7 +169,7 @@ func TestValidateDispatchConfigChecksReverse(t *testing.T) {
 		return c
 	}
 	c := base()
-	if err := validateDispatchConfig(&c); err != nil {
+	if err := validateExecutorConfig(&c); err != nil {
 		t.Fatalf("valid Reverse block refused: %v", err)
 	}
 	for name, mutate := range map[string]func(*SlurmConfig){
@@ -180,7 +180,7 @@ func TestValidateDispatchConfigChecksReverse(t *testing.T) {
 	} {
 		c := base()
 		mutate(&c)
-		if err := validateDispatchConfig(&c); err == nil {
+		if err := validateExecutorConfig(&c); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
 	}
@@ -188,7 +188,7 @@ func TestValidateDispatchConfigChecksReverse(t *testing.T) {
 
 // tokenRequests answers TokenRequests with a token naming the ServiceAccount, and
 // records them.
-func tokenRequests(e *dispatchEnv) *[]k8stesting.CreateActionImpl {
+func tokenRequests(e *executorEnv) *[]k8stesting.CreateActionImpl {
 	var seen []k8stesting.CreateActionImpl
 	e.kube.PrependReactor("create", "serviceaccounts", func(a k8stesting.Action) (bool, runtime.Object, error) {
 		create := a.(k8stesting.CreateActionImpl)
@@ -233,10 +233,10 @@ func findFile(t *testing.T, dir, name string) (string, bool) {
 
 // The API server's kube-api-access volume of a plain pod gets a token minted for
 // the pod's ServiceAccount, where the plugin writes projected volume files.
-func TestDispatchServiceAccountToken(t *testing.T) {
+func TestExecutorServiceAccountToken(t *testing.T) {
 	t.Setenv("SHARED_FS", "true")
-	rootCA := &v1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "kube-root-ca.crt", Namespace: dispatchNS}, Data: map[string]string{"ca.crt": "-----BEGIN CERTIFICATE-----\n"}}
-	e := newDispatchEnv(t, rootCA)
+	rootCA := &v1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "kube-root-ca.crt", Namespace: executorNS}, Data: map[string]string{"ca.crt": "-----BEGIN CERTIFICATE-----\n"}}
+	e := newExecutorEnv(t, rootCA)
 	seen := tokenRequests(e)
 	req := submitRequest(2)
 	ps := &req.PodSets[0]
@@ -251,22 +251,22 @@ func TestDispatchServiceAccountToken(t *testing.T) {
 	}
 	got := (*seen)[0]
 	tr := got.GetObject().(*authv1.TokenRequest)
-	if got.Namespace != dispatchNS || got.Name != "trainer" || tr.Spec.ExpirationSeconds == nil || *tr.Spec.ExpirationSeconds != 3607 || len(tr.Spec.Audiences) != 0 {
+	if got.Namespace != executorNS || got.Name != "trainer" || tr.Spec.ExpirationSeconds == nil || *tr.Spec.ExpirationSeconds != 3607 || len(tr.Spec.Audiences) != 0 {
 		t.Fatalf("TokenRequest %s/%s %+v", got.Namespace, got.Name, tr.Spec)
 	}
 	for i := 0; i < 2; i++ {
 		if token, ok := findFile(t, e.memberDir(i), "token"); !ok || token != "minted-for-trainer" {
 			t.Errorf("member %d: token file %q (found %v)", i, token, ok)
 		}
-		if ns, ok := findFile(t, e.memberDir(i), "namespace"); !ok || ns != dispatchNS {
+		if ns, ok := findFile(t, e.memberDir(i), "namespace"); !ok || ns != executorNS {
 			t.Errorf("member %d: namespace file %q (found %v)", i, ns, ok)
 		}
 	}
 }
 
-func TestDispatchServiceAccountTokenDefaults(t *testing.T) {
+func TestExecutorServiceAccountTokenDefaults(t *testing.T) {
 	t.Setenv("SHARED_FS", "true")
-	e := newDispatchEnv(t)
+	e := newExecutorEnv(t)
 	seen := tokenRequests(e)
 	req := submitRequest(1)
 	ps := &req.PodSets[0]
@@ -288,8 +288,8 @@ func TestDispatchServiceAccountTokenDefaults(t *testing.T) {
 	}
 }
 
-func TestDispatchNoTokenWithoutProjection(t *testing.T) {
-	e := newDispatchEnv(t)
+func TestExecutorNoTokenWithoutProjection(t *testing.T) {
+	e := newExecutorEnv(t)
 	seen := tokenRequests(e)
 	req := submitRequest(1)
 	req.PodSets[0].Template.Spec.AutomountServiceAccountToken = ptrBool(true)
@@ -304,8 +304,8 @@ func TestDispatchNoTokenWithoutProjection(t *testing.T) {
 	}
 }
 
-func TestDispatchTokenRefusedIsPermanent(t *testing.T) {
-	e := newDispatchEnv(t)
+func TestExecutorTokenRefusedIsPermanent(t *testing.T) {
+	e := newExecutorEnv(t)
 	e.kube.PrependReactor("create", "serviceaccounts", func(a k8stesting.Action) (bool, runtime.Object, error) {
 		return true, nil, apierrors.NewForbidden(v1.Resource("serviceaccounts/token"), "default", nil)
 	})
@@ -316,5 +316,84 @@ func TestDispatchTokenRefusedIsPermanent(t *testing.T) {
 	rec := e.do(http.MethodPost, "/submit", req)
 	if rec.Code != http.StatusBadRequest || !decodeError(t, rec).Permanent || !strings.Contains(decodeError(t, rec).Message, `ServiceAccount "default"`) {
 		t.Fatalf("forbidden TokenRequest = %d %s, want a permanent 400", rec.Code, rec.Body.String())
+	}
+}
+
+// A plain pod's step (Argo's executor) reaches the API server through its tunnel and
+// addresses its own pod: the downward API names the real pod, and the kubelet's
+// service variables point at the tunnel.
+func TestExecutorSinglePodSeesItself(t *testing.T) {
+	t.Setenv("SHARED_FS", "true")
+	rootCA := &v1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "kube-root-ca.crt", Namespace: executorNS}, Data: map[string]string{"ca.crt": "-----BEGIN CERTIFICATE-----\n"}}
+	e := newExecutorEnv(t, rootCA)
+	tokenRequests(e)
+	e.d.Sidecar.Config.Executor.KubernetesAPI = ExecutorKubernetesAPI{Host: "kubernetes.default.svc.cluster.local", Port: "6443"}
+	req := submitRequest(1)
+	req.Owner = ExecutorOwner{APIVersion: "v1", Kind: "Pod", Name: "step-7f2k", UID: "real-pod-uid"}
+	ps := &req.PodSets[0]
+	ps.ConfigMapRefs = []string{"kube-root-ca.crt"}
+	ps.Template.Spec.Volumes = []v1.Volume{kubeAPIAccessVolume()}
+	ps.Template.Spec.Containers[0].Env = []v1.EnvVar{
+		{Name: "ARGO_POD_NAME", ValueFrom: &v1.EnvVarSource{FieldRef: &v1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
+		{Name: "ARGO_POD_UID", ValueFrom: &v1.EnvVarSource{FieldRef: &v1.ObjectFieldSelector{FieldPath: "metadata.uid"}}},
+	}
+	e.submit(req)
+	raw, err := os.ReadFile(e.memberDir(0) + "/" + executorCtn + "_envfile.properties")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := string(raw)
+	for _, want := range []string{"ARGO_POD_NAME=step-7f2k", "ARGO_POD_UID=real-pod-uid", "KUBERNETES_SERVICE_HOST=kubernetes.default.svc.cluster.local", "KUBERNETES_SERVICE_PORT=6443"} {
+		if !strings.Contains(env, want) {
+			t.Errorf("env file lacks %s:\n%s", want, env)
+		}
+	}
+
+	// Without a token the job gets no API address.
+	e2 := newExecutorEnv(t)
+	e2.d.Sidecar.Config.Executor.KubernetesAPI = ExecutorKubernetesAPI{Host: "kubernetes.default.svc.cluster.local", Port: "6443"}
+	e2.submit(submitRequest(1))
+	raw, err = os.ReadFile(e2.memberDir(0) + "/" + executorCtn + "_envfile.properties")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "KUBERNETES_SERVICE_HOST") {
+		t.Errorf("a job without a token got the API address:\n%s", raw)
+	}
+}
+
+// A Job's template has no ServiceAccount directory (the API server adds it to pods, and
+// the workload's pods never exist): the executor adds it, with the namespace and the CA, and
+// with a token only when the site allows cluster tokens.
+func TestExecutorServiceAccountDirectory(t *testing.T) {
+	t.Setenv("SHARED_FS", "true")
+	for _, tc := range []struct {
+		name       string
+		automount  *bool
+		siteTokens bool
+		wantDir    bool
+		wantToken  bool
+	}{
+		{"default, no cluster tokens", nil, false, true, false},
+		{"default, cluster tokens", nil, true, true, true},
+		{"opted out", ptrBool(false), true, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newExecutorEnv(t)
+			seen := tokenRequests(e)
+			e.d.Sidecar.Config.Executor.AutomountServiceAccountToken = tc.siteTokens
+			req := submitRequest(1)
+			req.PodSets[0].Template.Spec.AutomountServiceAccountToken = tc.automount
+			e.submit(req)
+			ns, hasNS := findFile(t, e.memberDir(0), "namespace")
+			_, hasCA := findFile(t, e.memberDir(0), "ca.crt")
+			token, hasToken := findFile(t, e.memberDir(0), "token")
+			if hasNS != tc.wantDir || hasCA != tc.wantDir || (hasNS && ns != executorNS) {
+				t.Errorf("namespace %q (%v), ca.crt %v; want the directory: %v", ns, hasNS, hasCA, tc.wantDir)
+			}
+			if hasToken != tc.wantToken || len(*seen) != map[bool]int{true: 1, false: 0}[tc.wantToken] || (hasToken && token != "minted-for-default") {
+				t.Errorf("token %q (%v), %d TokenRequests; want a token: %v", token, hasToken, len(*seen), tc.wantToken)
+			}
+		})
 	}
 }

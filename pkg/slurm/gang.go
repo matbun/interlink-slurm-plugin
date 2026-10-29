@@ -235,8 +235,9 @@ func produceGangSLURMScript(
 	// gang-specific and prepended explicitly. Deduplication in buildSbatchFlags
 	// runs on the flavor/annotation set; our fixed --nodes/--ntasks-per-node are
 	// added after and are not user-overridable here.
-	flags := buildSbatchFlags(ctx, config, head.Pod, head.Pod.ObjectMeta, head.RuntimeCommands,
-		head.ResourceLimits, head.IsDefaultCPU, head.IsDefaultRAM, head.Flavor, true /*suppressDefaultMem*/)
+	sizePod, sizeLimits, sizeDefaultCPU, sizeDefaultRAM := gangNodeShape(ctx, ordered)
+	flags := buildSbatchFlags(ctx, config, sizePod, head.Pod.ObjectMeta, head.RuntimeCommands,
+		sizeLimits, sizeDefaultCPU, sizeDefaultRAM, head.Flavor, true /*suppressDefaultMem*/)
 
 	// --- launcher selection (injected-launcher path) --------------------------
 	// interlink.eu/launcher names a function of the site file (`<name>-launcher`),
@@ -393,6 +394,29 @@ func produceGangSLURMScript(
 	}
 	log.G(ctx).Infof("Rendered gang sbatch for '%s' (%d nodes) at %s", entry.Name, n, scriptPath)
 	return scriptPath, nil
+}
+
+// gangNodeShape returns what the per-node flags are built from: the head, with
+// the largest CPU, memory and GPU request of any member. Every rank gets one node
+// of the same shape, so members that differ (several PodSets of a Workload) must
+// each fit in it; sized from the head alone, a larger worker would not.
+func gangNodeShape(ctx context.Context, ordered []*BufferedMember) (v1.Pod, ResourceLimits, bool, bool) {
+	head := ordered[0]
+	pod, limits := head.Pod, head.ResourceLimits
+	defaultCPU, defaultRAM := head.IsDefaultCPU, head.IsDefaultRAM
+	gpus := detectGPUResources(ctx, pod.Spec.Containers)
+	for _, m := range ordered[1:] {
+		if !m.IsDefaultCPU && (defaultCPU || m.ResourceLimits.CPU > limits.CPU) {
+			limits.CPU, defaultCPU = m.ResourceLimits.CPU, false
+		}
+		if !m.IsDefaultRAM && (defaultRAM || m.ResourceLimits.Memory > limits.Memory) {
+			limits.Memory, defaultRAM = m.ResourceLimits.Memory, false
+		}
+		if n := detectGPUResources(ctx, m.Pod.Spec.Containers); n > gpus {
+			pod.Spec.Containers, gpus = m.Pod.Spec.Containers, n
+		}
+	}
+	return pod, limits, defaultCPU, defaultRAM
 }
 
 // emitGangPerRankLaunch renders the DEFAULT per-rank launch section (Ray/torch):

@@ -22,7 +22,7 @@ var sshTemplate string
 var parsedSSHTemplate = template.Must(template.New("shadow").Parse(sshTemplate))
 
 // sshTunnel carries the fields of the virtual kubelet's Network.SSH block the
-// template reads. The agent supports public key authentication only.
+// template reads. The executor supports public key authentication only.
 type sshTunnel struct {
 	LoginHost           string
 	Port                int
@@ -161,13 +161,13 @@ func render(cfg Config, spec Spec, name string, ports []portMapping, logsOnly bo
 	return deployment, service, nil
 }
 
-// jobLogs is the container that streams the job's output from the agent.
+// jobLogs is the container that streams the job's output from the executor.
 func jobLogs(cfg Config, workloadUID string) corev1.Container {
 	noEscalation := false
 	return corev1.Container{
 		Name:    jobLogsContainer,
-		Image:   cfg.AgentImage,
-		Command: []string{jobLogsCommand, "logs", "--agent", cfg.AgentURL, "--workload", workloadUID, "--follow"},
+		Image:   cfg.ExecutorImage,
+		Command: []string{jobLogsCommand, "logs", "--executor", cfg.ExecutorURL, "--workload", workloadUID, "--follow"},
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{
 				corev1.ResourceCPU:    resource.MustParse("10m"),

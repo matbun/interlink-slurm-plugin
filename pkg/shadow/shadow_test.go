@@ -32,8 +32,8 @@ const (
 
 func testConfig() Config {
 	return Config{
-		AgentImage:          "registry.example.org/interlink-agent:1.0",
-		AgentURL:            "http://interlink-agent:8000",
+		ExecutorImage:       "registry.example.org/kueue-offload-executor:1.0",
+		ExecutorURL:         "http://kueue-offload-executor:8000",
 		LoginHost:           "login.hpc-a.example.org",
 		User:                "alice",
 		KeySecret:           "hpc-a-tunnel-key",
@@ -166,11 +166,11 @@ func TestEnsureNotebook(t *testing.T) {
 	}
 
 	logs := container(t, d, "job-logs")
-	wantCmd := []string{"/sidecar/slurm-sidecar", "logs", "--agent", "http://interlink-agent:8000", "--workload", testUID, "--follow"}
+	wantCmd := []string{"/sidecar/slurm-sidecar", "logs", "--executor", "http://kueue-offload-executor:8000", "--workload", testUID, "--follow"}
 	if !slices.Equal(logs.Command, wantCmd) {
 		t.Errorf("job-logs command %v, want %v", logs.Command, wantCmd)
 	}
-	if logs.Image != "registry.example.org/interlink-agent:1.0" {
+	if logs.Image != "registry.example.org/kueue-offload-executor:1.0" {
 		t.Errorf("job-logs image %s", logs.Image)
 	}
 	r := logs.Resources
@@ -583,16 +583,16 @@ func TestResourceName(t *testing.T) {
 }
 
 func TestNormalizeConfig(t *testing.T) {
-	t.Setenv(AgentImageEnv, "registry.example.org/interlink-agent:from-env")
+	t.Setenv(ExecutorImageEnv, "registry.example.org/kueue-offload-executor:from-env")
 	cfg := testConfig()
-	cfg.AgentImage = ""
+	cfg.ExecutorImage = ""
 	cfg.ForwardTarget = ""
 	if err := NormalizeConfig(&cfg); err != nil {
 		t.Fatal(err)
 	}
 	want := Config{
-		Image: DefaultImage, AgentImage: "registry.example.org/interlink-agent:from-env",
-		AgentURL: cfg.AgentURL, LoginHost: cfg.LoginHost, User: cfg.User, Port: 22,
+		Image: DefaultImage, ExecutorImage: "registry.example.org/kueue-offload-executor:from-env",
+		ExecutorURL: cfg.ExecutorURL, LoginHost: cfg.LoginHost, User: cfg.User, Port: 22,
 		KeySecret: cfg.KeySecret, KeySecretKey: "ssh-privatekey", KnownHostsConfigMap: cfg.KnownHostsConfigMap,
 		NodeHostKeys: NodeHostKeysVerify, ForwardTarget: ForwardTargetLogin, ForwardMode: ForwardModePortForward,
 		NodeWaitTimeout: "2h",
@@ -611,27 +611,27 @@ func TestNormalizeConfig(t *testing.T) {
 		t.Errorf("exec mode: %v, %+v", err, execMode)
 	}
 
-	t.Setenv(AgentImageEnv, "")
+	t.Setenv(ExecutorImageEnv, "")
 	for name, broken := range map[string]func(*Config){
-		"no agent image":       func(c *Config) { c.AgentImage = "" },
-		"no agent url":         func(c *Config) { c.AgentURL = "" },
-		"agent url not http":   func(c *Config) { c.AgentURL = "interlink-agent:8000" },
-		"no login host":        func(c *Config) { c.LoginHost = "" },
-		"login host injection": func(c *Config) { c.LoginHost = "login;id" },
-		"user with space":      func(c *Config) { c.User = "alice -oProxyCommand=id" },
-		"no key secret":        func(c *Config) { c.KeySecret = "" },
-		"bad key secret key":   func(c *Config) { c.KeySecretKey = "../id" },
-		"port out of range":    func(c *Config) { c.Port = 70000 },
-		"unknown mode":         func(c *Config) { c.ForwardMode = "socks" },
-		"unknown target":       func(c *Config) { c.ForwardTarget = "both" },
-		"unknown host keys":    func(c *Config) { c.NodeHostKeys = "trust" },
-		"quoted exec command":  func(c *Config) { c.ForwardMode, c.ExecConnectCommand = ForwardModeExec, "nc'" },
-		"bad wait":             func(c *Config) { c.NodeWaitTimeout = "forever" },
-		"unknown node exec":    func(c *Config) { c.Reverse.NodeExec = "pbsdsh" },
-		"unknown sshd":         func(c *Config) { c.Reverse.Sshd = "dropbear" },
-		"quoted srun command":  func(c *Config) { c.Reverse.NodeExec, c.ExecConnectCommand = ReverseNodeExecSrun, "nc'" },
-		"target without port":  func(c *Config) { c.Reverse.AllowedTargets = []string{"mlflow.alice.svc.cluster.local"} },
-		"target injection":     func(c *Config) { c.Reverse.AllowedTargets = []string{"a;id:443"} },
+		"no executor image":     func(c *Config) { c.ExecutorImage = "" },
+		"no executor url":       func(c *Config) { c.ExecutorURL = "" },
+		"executor url not http": func(c *Config) { c.ExecutorURL = "kueue-offload-executor:8000" },
+		"no login host":         func(c *Config) { c.LoginHost = "" },
+		"login host injection":  func(c *Config) { c.LoginHost = "login;id" },
+		"user with space":       func(c *Config) { c.User = "alice -oProxyCommand=id" },
+		"no key secret":         func(c *Config) { c.KeySecret = "" },
+		"bad key secret key":    func(c *Config) { c.KeySecretKey = "../id" },
+		"port out of range":     func(c *Config) { c.Port = 70000 },
+		"unknown mode":          func(c *Config) { c.ForwardMode = "socks" },
+		"unknown target":        func(c *Config) { c.ForwardTarget = "both" },
+		"unknown host keys":     func(c *Config) { c.NodeHostKeys = "trust" },
+		"quoted exec command":   func(c *Config) { c.ForwardMode, c.ExecConnectCommand = ForwardModeExec, "nc'" },
+		"bad wait":              func(c *Config) { c.NodeWaitTimeout = "forever" },
+		"unknown node exec":     func(c *Config) { c.Reverse.NodeExec = "pbsdsh" },
+		"unknown sshd":          func(c *Config) { c.Reverse.Sshd = "dropbear" },
+		"quoted srun command":   func(c *Config) { c.Reverse.NodeExec, c.ExecConnectCommand = ReverseNodeExecSrun, "nc'" },
+		"target without port":   func(c *Config) { c.Reverse.AllowedTargets = []string{"mlflow.alice.svc.cluster.local"} },
+		"target injection":      func(c *Config) { c.Reverse.AllowedTargets = []string{"a;id:443"} },
 		"socks with targets": func(c *Config) {
 			c.Reverse.AllowSocks, c.Reverse.AllowedTargets = true, []string{"mlflow.alice.svc.cluster.local:443"}
 		},

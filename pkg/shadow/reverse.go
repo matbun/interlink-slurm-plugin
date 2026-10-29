@@ -55,7 +55,7 @@ const (
 	reversePrivilegedPortLimit = 1024
 )
 
-// ReverseConfig is the agent's Shadow.Reverse block: the virtual kubelet's
+// ReverseConfig is the executor's Shadow.Reverse block: the virtual kubelet's
 // Network.SSH.Reverse plus AllowedTargets.
 type ReverseConfig struct {
 	// Enabled lets workloads ask for it (default false). A workload that asks
@@ -168,10 +168,10 @@ func ParseReverseTunnel(annotations map[string]string, podUID, jobName string, c
 		return nil, nil
 	}
 	if !cfg.Enabled {
-		return nil, fmt.Errorf("%s is set, but this agent does not allow the reverse tunnel (Shadow.Reverse.Enabled)", AnnReverseForwards)
+		return nil, fmt.Errorf("%s is set, but this executor does not allow the reverse tunnel (Shadow.Reverse.Enabled)", AnnReverseForwards)
 	}
 	if strings.TrimSpace(annotations[AnnReverseSocksPort]) != "" && !cfg.AllowSocks {
-		return nil, fmt.Errorf("%s is set, but this agent does not allow a SOCKS proxy (Shadow.Reverse.AllowSocks)", AnnReverseSocksPort)
+		return nil, fmt.Errorf("%s is set, but this executor does not allow a SOCKS proxy (Shadow.Reverse.AllowSocks)", AnnReverseSocksPort)
 	}
 	rt := &ReverseTunnel{
 		NodeExec:   cfg.NodeExec,

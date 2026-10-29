@@ -38,12 +38,12 @@ func (noopShadowManager) Delete(context.Context, string) error { return nil }
 // shadowConfig is the Shadow block as the shadow package reads it, with the
 // site's LoginHost, User and Port where the block leaves them unset.
 func (c SlurmConfig) shadowConfig() shadow.Config {
-	_, site := c.DispatchSite()
+	_, site := c.ExecutorSite()
 	s := c.Shadow
 	cfg := shadow.Config{
 		Image:               s.Image,
-		AgentImage:          s.AgentImage,
-		AgentURL:            s.AgentURL,
+		ExecutorImage:       s.ExecutorImage,
+		ExecutorURL:         s.ExecutorURL,
 		LoginHost:           s.LoginHost,
 		User:                s.User,
 		Port:                s.Port,
@@ -70,12 +70,12 @@ func (c SlurmConfig) shadowConfig() shadow.Config {
 	return cfg
 }
 
-// NewShadowManager returns the manager of the shadows in the agent's namespace,
+// NewShadowManager returns the manager of the shadows in the executor's namespace,
 // or the reason the Shadow block cannot render one.
 func NewShadowManager(kube kubernetes.Interface, c SlurmConfig) (ShadowManager, error) {
 	cfg := c.shadowConfig()
 	if err := shadow.NormalizeConfig(&cfg); err != nil {
 		return nil, err
 	}
-	return shadow.NewManager(kube, c.Dispatch.Namespace, cfg), nil
+	return shadow.NewManager(kube, c.Executor.Namespace, cfg), nil
 }

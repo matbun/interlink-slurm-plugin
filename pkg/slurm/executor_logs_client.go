@@ -19,7 +19,7 @@ const LogsReconnectBanner = "--- log stream reconnected, full log follows ---"
 // logsRetryDelay is how long the logs command waits before it reconnects.
 var logsRetryDelay = 5 * time.Second
 
-// RunLogsCommand is "logs --agent <url> --workload <uid> [--container <c>]
+// RunLogsCommand is "logs --executor <url> --workload <uid> [--container <c>]
 // [--follow]": it copies the workload's /getLogs to stdout. When the stream
 // breaks before its end it waits, prints LogsReconnectBanner and copies the whole
 // log again. With --follow, a stream that ended cleanly leaves the command idle
@@ -27,15 +27,15 @@ var logsRetryDelay = 5 * time.Second
 func RunLogsCommand(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("logs", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	agent := fs.String("agent", "", "URL of the agent")
+	executor := fs.String("executor", "", "URL of the executor")
 	workload := fs.String("workload", "", "UID of the workload")
 	container := fs.String("container", "", "container (default: the first one)")
 	follow := fs.Bool("follow", false, "follow the log until the job ends")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *agent == "" || *workload == "" {
-		return errors.New("logs: --agent and --workload are required")
+	if *executor == "" || *workload == "" {
+		return errors.New("logs: --executor and --workload are required")
 	}
 	q := url.Values{"workloadUID": {*workload}}
 	if *container != "" {
@@ -44,7 +44,7 @@ func RunLogsCommand(ctx context.Context, args []string, stdout, stderr io.Writer
 	if *follow {
 		q.Set("follow", "true")
 	}
-	target := strings.TrimRight(*agent, "/") + "/getLogs?" + q.Encode()
+	target := strings.TrimRight(*executor, "/") + "/getLogs?" + q.Encode()
 
 	connected := false
 	for {
@@ -72,7 +72,7 @@ func RunLogsCommand(ctx context.Context, args []string, stdout, stderr io.Writer
 }
 
 // copyLogsOnce copies one /getLogs answer to out. connected is set once the
-// agent answered 200; err is nil only for a stream that reached its end.
+// executor answered 200; err is nil only for a stream that reached its end.
 func copyLogsOnce(ctx context.Context, target string, out io.Writer) (connected bool, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
@@ -85,7 +85,7 @@ func copyLogsOnce(ctx context.Context, target string, out io.Writer) (connected 
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return false, fmt.Errorf("agent answered %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		return false, fmt.Errorf("executor answered %s: %s", resp.Status, strings.TrimSpace(string(body)))
 	}
 	if _, err := io.Copy(out, resp.Body); err != nil {
 		return true, err

@@ -139,13 +139,15 @@ type SlurmConfig struct {
 	// plugin's own time zone.
 	SiteTimeZone string `yaml:"SiteTimeZone"`
 
-	// Dispatch turns the plugin into an interlink-dispatch agent: /submit, /jobs
-	// and the workload form of /getLogs. See dispatch.go.
-	Dispatch DispatchConfig `yaml:"Dispatch"`
-	// Sites are the HPC sites the agent submits to, by name. One in this version.
+	// Executor turns the plugin into a kueue-offload executor: /submit, /jobs
+	// and the workload form of /getLogs. See executor.go.
+	Executor ExecutorConfig `yaml:"Executor"`
+	// Sites are the HPC sites the executor submits to, by name. One in this version.
 	Sites map[string]SiteConfig `yaml:"Sites"`
 	// Shadow configures the pod that carries a running job's tunnel and logs.
 	Shadow ShadowConfig `yaml:"Shadow"`
+	// Staging copies a workload's inputs to the site and its outputs back.
+	Staging StagingConfig `yaml:"Staging"`
 }
 
 type CreateStruct struct {

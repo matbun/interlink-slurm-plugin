@@ -16,27 +16,27 @@ const preExecAnnotation = "slurm-job.vk.io/pre-exec"
 // carrier finds the allocation: the single-pod script names the job after its
 // pod, a gang after its group (the workload UID).
 func reverseJobName(req SubmitRequest) string {
-	if req.PodSets[0].Count > 1 {
+	if workloadMembers(req) > 1 {
 		return req.WorkloadUID
 	}
 	return memberUID(req.WorkloadUID, 0)
 }
 
-// reverseTunnel parses the reverse annotations of the workload's template, with
+// reverseTunnel parses the reverse annotations of the head's template, with
 // the same rules as the virtual kubelet plus Shadow.Reverse.AllowedTargets. It is
 // nil when the template asks for none.
-func (d *Dispatcher) reverseTunnel(req SubmitRequest) (*shadow.ReverseTunnel, *apiError) {
+func (d *Executor) reverseTunnel(req SubmitRequest) (*shadow.ReverseTunnel, *apiError) {
 	ps := req.PodSets[0]
 	if !shadow.HasReverseAnnotations(ps.Template.Annotations) {
 		return nil, nil
 	}
 	cfg := d.config()
 	if !cfg.Shadow.Enabled {
-		return nil, permanentError("%s is set, but this agent runs no shadows (Shadow.Enabled) to carry the tunnel", shadow.AnnReverseForwards)
+		return nil, permanentError("%s is set, but this executor runs no shadows (Shadow.Enabled) to carry the tunnel", shadow.AnnReverseForwards)
 	}
 	// A site launcher starts every rank from the batch shell, where the tunnel's
 	// /etc/hosts would reach ranks on nodes that have no relay.
-	if ps.Count > 1 && selectedLauncherName(ps.Template.ObjectMeta) != "" {
+	if workloadMembers(req) > 1 && selectedLauncherName(ps.Template.ObjectMeta) != "" {
 		return nil, permanentError("%s cannot be combined with %s: only the head rank has the tunnel", shadow.AnnReverseForwards, LauncherAnnotation)
 	}
 	rcfg := cfg.Shadow.Reverse
@@ -48,7 +48,7 @@ func (d *Dispatcher) reverseTunnel(req SubmitRequest) (*shadow.ReverseTunnel, *a
 		return nil, permanentError("%v", err)
 	}
 	if rt.SocksPort != 0 {
-		log.G(context.Background()).Warningf("dispatch: workload %s: SOCKS proxy on 127.0.0.1:%d on the compute node: every user of that node can reach through it any endpoint the shadow reaches in the cluster", req.WorkloadUID, rt.SocksPort)
+		log.G(context.Background()).Warningf("executor: workload %s: SOCKS proxy on 127.0.0.1:%d on the compute node: every user of that node can reach through it any endpoint the shadow reaches in the cluster", req.WorkloadUID, rt.SocksPort)
 	}
 	return rt, nil
 }

@@ -1,14 +1,14 @@
 package slurm
 
-// interlink-dispatch agent.
+// kueue-offload executor.
 //
-// With Dispatch.Enabled the plugin also answers the dispatcher, an admission
+// With Executor.Enabled the plugin also answers the offload controller, an admission
 // check controller that hands it the Kueue Workloads to run: POST /submit turns a
-// Workload's PodSet into member pods and runs them through the create path the
+// Workload's PodSets into member pods and runs them through the create path the
 // virtual kubelet uses (one pod: the single-pod script; several: one gang job),
 // GET /jobs/{workloadUID} maps the members' status to one job state, and DELETE
-// /jobs/{workloadUID} cancels the job and removes what the agent made for it.
-// The agent keeps one record per workload in Dispatch.StateDir.
+// /jobs/{workloadUID} cancels the job and removes what the executor made for it.
+// The executor keeps one record per workload in Executor.StateDir.
 
 import (
 	"context"
@@ -35,8 +35,8 @@ import (
 	commonIL "github.com/interlink-hq/interlink/pkg/interlink"
 )
 
-// DispatchAPIVersion is carried by every body of the agent API.
-const DispatchAPIVersion = "dispatch.interlink.eu/v1alpha1"
+// ExecutorAPIVersion is carried by every body of the executor API.
+const ExecutorAPIVersion = "offload.interlink.eu/v1alpha1"
 
 // Job states of GET /jobs.
 const (
@@ -55,19 +55,20 @@ const maxWorkloadMembers = 9999
 // maxSubmitBody bounds the size of a /submit request.
 const maxSubmitBody = 8 << 20
 
-// DispatchOwner is the object a Workload belongs to.
-type DispatchOwner struct {
+// ExecutorOwner is the object a Workload belongs to.
+type ExecutorOwner struct {
 	APIVersion string `json:"apiVersion,omitempty"`
 	Kind       string `json:"kind,omitempty"`
 	Name       string `json:"name"`
 	UID        string `json:"uid,omitempty"`
 }
 
-// DispatchPodSet is one PodSet of a Workload.
-type DispatchPodSet struct {
+// ExecutorPodSet is one PodSet of a Workload.
+type ExecutorPodSet struct {
 	Name          string             `json:"name"`
 	Count         int32              `json:"count"`
 	Partition     string             `json:"partition,omitempty"`
+	QOS           string             `json:"qos,omitempty"`
 	Template      v1.PodTemplateSpec `json:"template"`
 	SecretRefs    []string           `json:"secretRefs,omitempty"`
 	ConfigMapRefs []string           `json:"configMapRefs,omitempty"`
@@ -79,10 +80,10 @@ type SubmitRequest struct {
 	WorkloadUID  string           `json:"workloadUID"`
 	WorkloadName string           `json:"workloadName"`
 	Namespace    string           `json:"namespace"`
-	Owner        DispatchOwner    `json:"owner"`
+	Owner        ExecutorOwner    `json:"owner"`
 	Site         string           `json:"site"`
 	Account      string           `json:"account"`
-	PodSets      []DispatchPodSet `json:"podSets"`
+	PodSets      []ExecutorPodSet `json:"podSets"`
 }
 
 // SubmitResponse answers an accepted /submit.
@@ -92,8 +93,8 @@ type SubmitResponse struct {
 	Accepted   bool   `json:"accepted"`
 }
 
-// DispatchError answers a refused call. Permanent means retrying cannot help.
-type DispatchError struct {
+// ExecutorError answers a refused call. Permanent means retrying cannot help.
+type ExecutorError struct {
 	APIVersion string `json:"apiVersion"`
 	Permanent  bool   `json:"permanent"`
 	Message    string `json:"message"`
@@ -126,7 +127,7 @@ type RankStatus struct {
 	Containers []v1.ContainerStatus `json:"containers"`
 }
 
-// workloadRecord is what the agent keeps about a submitted workload, in
+// workloadRecord is what the executor keeps about a submitted workload, in
 // <StateDir>/<workloadUID>.json. It holds the request as received: secret
 // values are resolved again from the cluster when needed, never stored.
 type workloadRecord struct {
@@ -140,10 +141,10 @@ type workloadRecord struct {
 	ShadowTerminal bool       `json:"shadowTerminal,omitempty"`
 }
 
-// Dispatcher serves the agent API on top of a SidecarHandler.
-type Dispatcher struct {
+// Executor serves the executor API on top of a SidecarHandler.
+type Executor struct {
 	Sidecar *SidecarHandler
-	// Kube reads the workloads' Secrets and ConfigMaps, in the agent's namespace
+	// Kube reads the workloads' Secrets and ConfigMaps, in the executor's namespace
 	// only, and reviews callers' tokens.
 	Kube kubernetes.Interface
 	// Shadow renders the shadows. Nil: no shadows.
@@ -170,18 +171,18 @@ func InClusterClient() (kubernetes.Interface, error) {
 	return kubernetes.NewForConfig(cfg)
 }
 
-// NewDispatcher returns a Dispatcher with the records found in StateDir.
-func NewDispatcher(sidecar *SidecarHandler, kube kubernetes.Interface, shadow ShadowManager) (*Dispatcher, error) {
-	d := &Dispatcher{Sidecar: sidecar, Kube: kube, Shadow: shadow, records: map[string]*workloadRecord{}}
+// NewExecutor returns an Executor with the records found in StateDir.
+func NewExecutor(sidecar *SidecarHandler, kube kubernetes.Interface, shadow ShadowManager) (*Executor, error) {
+	d := &Executor{Sidecar: sidecar, Kube: kube, Shadow: shadow, records: map[string]*workloadRecord{}}
 	if err := d.loadRecords(); err != nil {
 		return nil, err
 	}
 	return d, nil
 }
 
-// RegisterRoutes adds the agent API to mux, /getLogs included: its workload form
+// RegisterRoutes adds the executor API to mux, /getLogs included: its workload form
 // is answered here, the other passed to the SidecarHandler.
-func (d *Dispatcher) RegisterRoutes(mux *http.ServeMux) {
+func (d *Executor) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /submit", d.SubmitHandler)
 	mux.HandleFunc("GET /jobs/{workloadUID}", d.JobStatusHandler)
 	mux.HandleFunc("DELETE /jobs/{workloadUID}", d.JobDeleteHandler)
@@ -223,26 +224,26 @@ func writeJSON(w http.ResponseWriter, code int, body any) {
 }
 
 func writeAPIError(w http.ResponseWriter, e *apiError) {
-	writeJSON(w, e.code, DispatchError{APIVersion: DispatchAPIVersion, Permanent: e.permanent, Message: e.msg})
+	writeJSON(w, e.code, ExecutorError{APIVersion: ExecutorAPIVersion, Permanent: e.permanent, Message: e.msg})
 }
 
-func (d *Dispatcher) config() SlurmConfig { return d.Sidecar.Config }
+func (d *Executor) config() SlurmConfig { return d.Sidecar.Config }
 
-func (d *Dispatcher) shadowManager() ShadowManager {
+func (d *Executor) shadowManager() ShadowManager {
 	if d.Shadow == nil || !d.config().Shadow.Enabled {
 		return noopShadowManager{}
 	}
 	return d.Shadow
 }
 
-func (d *Dispatcher) record(uid string) *workloadRecord {
+func (d *Executor) record(uid string) *workloadRecord {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.records[uid]
 }
 
 // SubmitHandler is POST /submit.
-func (d *Dispatcher) SubmitHandler(w http.ResponseWriter, r *http.Request) {
+func (d *Executor) SubmitHandler(w http.ResponseWriter, r *http.Request) {
 	if !d.authorize(w, r) {
 		return
 	}
@@ -261,11 +262,11 @@ func (d *Dispatcher) SubmitHandler(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, permanentError("invalid request: %v", err))
 		return
 	}
-	log.G(d.Sidecar.Ctx).Info(sessionContextMessage, "dispatch: submit of workload ", req.WorkloadUID)
+	log.G(d.Sidecar.Ctx).Info(sessionContextMessage, "executor: submit of workload ", req.WorkloadUID)
 
 	jobID, created, aerr := d.submit(r.Context(), req)
 	if aerr != nil {
-		log.G(d.Sidecar.Ctx).Warning(sessionContextMessage, "dispatch: submit of workload ", req.WorkloadUID, " refused: ", aerr.msg)
+		log.G(d.Sidecar.Ctx).Warning(sessionContextMessage, "executor: submit of workload ", req.WorkloadUID, " refused: ", aerr.msg)
 		writeAPIError(w, aerr)
 		return
 	}
@@ -273,20 +274,20 @@ func (d *Dispatcher) SubmitHandler(w http.ResponseWriter, r *http.Request) {
 	if created {
 		code = http.StatusCreated
 	}
-	writeJSON(w, code, SubmitResponse{APIVersion: DispatchAPIVersion, JobID: jobID, Accepted: true})
+	writeJSON(w, code, SubmitResponse{APIVersion: ExecutorAPIVersion, JobID: jobID, Accepted: true})
 }
 
-// validateSubmit refuses a request this agent will never run.
-func (d *Dispatcher) validateSubmit(req SubmitRequest) *apiError {
+// validateSubmit refuses a request this executor will never run.
+func (d *Executor) validateSubmit(req SubmitRequest) *apiError {
 	cfg := d.config()
-	if req.APIVersion != "" && req.APIVersion != DispatchAPIVersion {
-		return permanentError("apiVersion %q: this agent speaks %s", req.APIVersion, DispatchAPIVersion)
+	if req.APIVersion != "" && req.APIVersion != ExecutorAPIVersion {
+		return permanentError("apiVersion %q: this executor speaks %s", req.APIVersion, ExecutorAPIVersion)
 	}
 	if !workloadUIDPattern.MatchString(req.WorkloadUID) {
 		return permanentError("invalid workloadUID %q", req.WorkloadUID)
 	}
-	if req.Namespace != cfg.Dispatch.Namespace {
-		return permanentError("namespace %q is not this agent's (%q)", req.Namespace, cfg.Dispatch.Namespace)
+	if req.Namespace != cfg.Executor.Namespace {
+		return permanentError("namespace %q is not this executor's (%q)", req.Namespace, cfg.Executor.Namespace)
 	}
 	site, ok := cfg.Sites[req.Site]
 	if !ok {
@@ -295,31 +296,72 @@ func (d *Dispatcher) validateSubmit(req SubmitRequest) *apiError {
 	if !slices.Contains(site.AllowedAccounts, req.Account) || !slurmNamePattern.MatchString(req.Account) {
 		return permanentError("account %q is not allowed on site %s", req.Account, req.Site)
 	}
-	if len(req.PodSets) != 1 {
-		return permanentError("the workload has %d PodSets: this agent runs exactly one", len(req.PodSets))
+	if len(req.PodSets) == 0 {
+		return permanentError("the workload has no PodSets")
 	}
-	ps := req.PodSets[0]
-	if ps.Count < 1 || ps.Count > maxWorkloadMembers {
-		return permanentError("PodSet %s: count %d is not between 1 and %d", ps.Name, ps.Count, maxWorkloadMembers)
+	total := 0
+	for _, ps := range req.PodSets {
+		if ps.Count < 1 || ps.Count > maxWorkloadMembers {
+			return permanentError("PodSet %s: count %d is not between 1 and %d", ps.Name, ps.Count, maxWorkloadMembers)
+		}
+		total += int(ps.Count)
+		if !slurmNamePattern.MatchString(ps.Partition) {
+			return permanentError("PodSet %s: invalid partition %q", ps.Name, ps.Partition)
+		}
+		if !slurmNamePattern.MatchString(ps.QOS) {
+			return permanentError("PodSet %s: invalid QOS %q", ps.Name, ps.QOS)
+		}
+		if len(ps.Template.Spec.Containers) == 0 {
+			return permanentError("PodSet %s: the template has no containers", ps.Name)
+		}
 	}
-	if !slurmNamePattern.MatchString(ps.Partition) {
-		return permanentError("PodSet %s: invalid partition %q", ps.Name, ps.Partition)
+	if total > maxWorkloadMembers {
+		return permanentError("the workload has %d members, more than %d", total, maxWorkloadMembers)
 	}
-	if len(ps.Template.Spec.Containers) == 0 {
-		return permanentError("PodSet %s: the template has no containers", ps.Name)
+	if total > 1 && !cfg.GangSchedulingEnabled {
+		return permanentError("the workload has %d members and needs GangSchedulingEnabled", total)
 	}
-	if ps.Count > 1 && !cfg.GangSchedulingEnabled {
-		return permanentError("PodSet %s: count %d needs GangSchedulingEnabled", ps.Name, ps.Count)
+	if aerr := validatePodSetsShareAllocation(req.PodSets); aerr != nil {
+		return aerr
 	}
 	if ownerName(req) == "" {
 		return permanentError("the workload has neither an owner name nor a name")
+	}
+	return d.validateStaging(req)
+}
+
+// validatePodSetsShareAllocation refuses PodSets that cannot run in one
+// allocation: it takes one partition, and a site launcher starts the head's
+// container on every rank, so the others' would never run.
+func validatePodSetsShareAllocation(podSets []ExecutorPodSet) *apiError {
+	first := podSets[0]
+	launcher := ""
+	for _, ps := range podSets {
+		if name := selectedLauncherName(ps.Template.ObjectMeta); name != "" {
+			launcher = name
+		}
+	}
+	for _, ps := range podSets[1:] {
+		if ps.QOS != first.QOS {
+			return permanentError("PodSet %s: QOS %q differs from PodSet %s's %q: the workload runs in one allocation", ps.Name, ps.QOS, first.Name, first.QOS)
+		}
+		if ps.Partition != first.Partition {
+			return permanentError("PodSet %s: partition %q differs from PodSet %s's %q: the workload runs in one allocation", ps.Name, ps.Partition, first.Name, first.Partition)
+		}
+		if launcher == "" {
+			continue
+		}
+		a, b := first.Template.Spec.Containers[0], ps.Template.Spec.Containers[0]
+		if a.Image != b.Image || !slices.Equal(a.Command, b.Command) || !slices.Equal(a.Args, b.Args) {
+			return permanentError("PodSet %s: launcher %q starts PodSet %s's container on every rank, so every PodSet needs the same image and command", ps.Name, launcher, first.Name)
+		}
 	}
 	return nil
 }
 
 // submit runs the workload, or returns the job it already has. created is false
 // for the latter.
-func (d *Dispatcher) submit(ctx context.Context, req SubmitRequest) (string, bool, *apiError) {
+func (d *Executor) submit(ctx context.Context, req SubmitRequest) (string, bool, *apiError) {
 	if aerr := d.validateSubmit(req); aerr != nil {
 		return "", false, aerr
 	}
@@ -330,20 +372,29 @@ func (d *Dispatcher) submit(ctx context.Context, req SubmitRequest) (string, boo
 		return rec.JobID, false, nil
 	}
 
-	ps := req.PodSets[0]
 	reverse, aerr := d.reverseTunnel(req)
 	if aerr != nil {
 		return "", false, aerr
 	}
-	refs, aerr := d.fetchRefs(ctx, req.Namespace, ps)
-	if aerr != nil {
+	for p := range req.PodSets {
+		withServiceAccountDir(&req.PodSets[p], d.config().Executor.AutomountServiceAccountToken)
+	}
+	refs := make([]podRefs, len(req.PodSets))
+	for p, ps := range req.PodSets {
+		if refs[p], aerr = d.fetchRefs(ctx, req.Namespace, ps); aerr != nil {
+			return "", false, aerr
+		}
+	}
+	if aerr := d.stageIn(ctx, req); aerr != nil {
 		return "", false, aerr
 	}
-	if refs.tokens, aerr = d.mintTokens(ctx, req.Namespace, ps.Template.Spec); aerr != nil {
-		return "", false, aerr
+	for p, ps := range req.PodSets {
+		if refs[p].tokens, aerr = d.mintTokens(ctx, req.Namespace, ps.Template.Spec); aerr != nil {
+			return "", false, aerr
+		}
 	}
 
-	count := int(ps.Count)
+	count := workloadMembers(req)
 	members := make([]*v1.Pod, 0, count)
 	datas := make([]commonIL.RetrievedPodData, 0, count)
 	for i := 0; i < count; i++ {
@@ -351,10 +402,14 @@ func (d *Dispatcher) submit(ctx context.Context, req SubmitRequest) (string, boo
 		if i == 0 && reverse != nil {
 			addReversePreExec(pod, reverse)
 		}
-		if aerr := resolveEnv(pod, refs); aerr != nil {
+		memberRefs := refs[memberPodSet(req, i)]
+		if api := d.config().Executor.KubernetesAPI; api.Host != "" && len(memberRefs.tokens) > 0 {
+			withKubernetesAPI(pod, api)
+		}
+		if aerr := resolveEnv(pod, memberRefs); aerr != nil {
 			return "", false, aerr
 		}
-		data, aerr := retrievedPodData(ctx, pod, refs)
+		data, aerr := retrievedPodData(ctx, pod, memberRefs)
 		if aerr != nil {
 			return "", false, aerr
 		}
@@ -384,13 +439,13 @@ func (d *Dispatcher) submit(ctx context.Context, req SubmitRequest) (string, boo
 	}
 	if err := d.saveRecord(rec); err != nil {
 		if cerr := d.scancel(jobID); cerr != nil {
-			log.G(d.Sidecar.Ctx).Error("dispatch: cannot cancel job ", jobID, " after failing to record it: ", cerr)
+			log.G(d.Sidecar.Ctx).Error("executor: cannot cancel job ", jobID, " after failing to record it: ", cerr)
 		}
 		d.removeMembers(ctx, members)
 		return "", false, transientError("recording workload %s: %v", req.WorkloadUID, err)
 	}
 	d.records[req.WorkloadUID] = rec
-	log.G(d.Sidecar.Ctx).Infof("dispatch: workload %s submitted as Slurm job %s (%d member(s))", req.WorkloadUID, jobID, count)
+	log.G(d.Sidecar.Ctx).Infof("executor: workload %s submitted as Slurm job %s (%d member(s))", req.WorkloadUID, jobID, count)
 	return jobID, true, nil
 }
 
@@ -420,7 +475,7 @@ func classifyCreateError(cerr *createError) *apiError {
 }
 
 // memberDirs returns a member's metadata directory and its job working directory.
-func (d *Dispatcher) memberDirs(pod *v1.Pod) (string, string) {
+func (d *Executor) memberDirs(pod *v1.Pod) (string, string) {
 	cfg := d.config()
 	uid := string(pod.UID)
 	filesPath := cfg.DataRootFolder + pod.Namespace + "-" + uid
@@ -433,7 +488,7 @@ func (d *Dispatcher) memberDirs(pod *v1.Pod) (string, string) {
 
 // removeMembers forgets the members and removes their directories. It cancels
 // nothing.
-func (d *Dispatcher) removeMembers(ctx context.Context, members []*v1.Pod) {
+func (d *Executor) removeMembers(ctx context.Context, members []*v1.Pod) {
 	cfg := d.config()
 	uids := make([]string, 0, len(members))
 	for _, m := range members {
@@ -449,7 +504,7 @@ func (d *Dispatcher) removeMembers(ctx context.Context, members []*v1.Pod) {
 				continue
 			}
 			if err := os.RemoveAll(dir); err != nil {
-				log.G(d.Sidecar.Ctx).Warning("dispatch: cannot remove ", dir, ": ", err)
+				log.G(d.Sidecar.Ctx).Warning("executor: cannot remove ", dir, ": ", err)
 			}
 		}
 	}
@@ -458,7 +513,7 @@ func (d *Dispatcher) removeMembers(ctx context.Context, members []*v1.Pod) {
 
 // slurmJobState asks squeue for the job's compact state and reason. gone is set
 // when Slurm no longer knows the job.
-func (d *Dispatcher) slurmJobState(jid string) (state, reason string, gone bool, err error) {
+func (d *Executor) slurmJobState(jid string) (state, reason string, gone bool, err error) {
 	shell := exec2.ExecTask{
 		Command: d.config().Squeuepath,
 		Args:    []string{squeueNoHeader, "-a", "--states=all", "-O", "StateCompact,Reason:128", "-j", jid},
@@ -521,7 +576,7 @@ var slurmStateReasons = map[string]string{
 
 // scancel cancels the job. A job Slurm has already ended or forgotten is not an
 // error.
-func (d *Dispatcher) scancel(jid string) error {
+func (d *Executor) scancel(jid string) error {
 	out, err := exec.Command(d.config().Scancelpath, jid).CombinedOutput() //nolint:gosec // scancel from the site config, jid is the numeric job ID
 	if err == nil {
 		return nil
@@ -534,14 +589,14 @@ func (d *Dispatcher) scancel(jid string) error {
 }
 
 // JobStatusHandler is GET /jobs/{workloadUID}.
-func (d *Dispatcher) JobStatusHandler(w http.ResponseWriter, r *http.Request) {
+func (d *Executor) JobStatusHandler(w http.ResponseWriter, r *http.Request) {
 	if !d.authorize(w, r) {
 		return
 	}
 	uid := r.PathValue("workloadUID")
 	rec := d.record(uid)
 	if rec == nil {
-		writeJSON(w, http.StatusNotFound, DispatchError{APIVersion: DispatchAPIVersion, Permanent: true, Message: "no job for workload " + uid})
+		writeJSON(w, http.StatusNotFound, ExecutorError{APIVersion: ExecutorAPIVersion, Permanent: true, Message: "no job for workload " + uid})
 		return
 	}
 	st, aerr := d.jobStatus(r.Context(), rec, GetSessionContextMessage(GetSessionContext(r)))
@@ -555,7 +610,7 @@ func (d *Dispatcher) JobStatusHandler(w http.ResponseWriter, r *http.Request) {
 // memberPods rebuilds the record's members as /submit made them, without the
 // values of their references.
 func memberPods(rec *workloadRecord) []*v1.Pod {
-	n := int(rec.Request.PodSets[0].Count)
+	n := workloadMembers(rec.Request)
 	pods := make([]*v1.Pod, 0, n)
 	for i := 0; i < n; i++ {
 		pods = append(pods, buildMember(rec.Request, i))
@@ -565,13 +620,13 @@ func memberPods(rec *workloadRecord) []*v1.Pod {
 
 // jobStatus maps the members' status, as the plugin reports it, and Slurm's
 // state of the job to one job state.
-func (d *Dispatcher) jobStatus(ctx context.Context, rec *workloadRecord, sessionContextMessage string) (JobStatus, *apiError) {
+func (d *Executor) jobStatus(ctx context.Context, rec *workloadRecord, sessionContextMessage string) (JobStatus, *apiError) {
 	members := memberPods(rec)
 	uids := make([]string, len(members))
 	for i, m := range members {
 		uids[i] = string(m.UID)
 	}
-	st := JobStatus{APIVersion: DispatchAPIVersion, WorkloadUID: rec.Request.WorkloadUID, JobID: rec.JobID}
+	st := JobStatus{APIVersion: ExecutorAPIVersion, WorkloadUID: rec.Request.WorkloadUID, JobID: rec.JobID}
 
 	state, reason, gone, err := d.slurmJobState(rec.JobID)
 	if err != nil {
@@ -654,7 +709,7 @@ func (d *Dispatcher) jobStatus(ctx context.Context, rec *workloadRecord, session
 		st.Message = fmt.Sprintf("Slurm job %s vanished with no exit status", rec.JobID)
 	case state == "CA":
 		st.State, st.Reason = JobCancelled, "Cancelled"
-		st.Message = fmt.Sprintf("Slurm job %s was cancelled outside the agent", rec.JobID)
+		st.Message = fmt.Sprintf("Slurm job %s was cancelled outside the executor", rec.JobID)
 	case state == "CD":
 		st.State, st.Reason = JobCompleted, "Completed"
 		if failedRank >= 0 {
@@ -687,6 +742,7 @@ func (d *Dispatcher) jobStatus(ctx context.Context, rec *workloadRecord, session
 	}
 
 	d.syncShadow(ctx, rec, st)
+	d.stageOut(ctx, rec, &st)
 	d.mu.Lock()
 	st.Shadow = rec.Shadow
 	d.mu.Unlock()
@@ -765,7 +821,7 @@ func terminatedReason(containers []v1.ContainerStatus) string {
 // statusesFromFiles reads the members' status from the files their job left,
 // for a job Slurm no longer knows. A container with no status file did not end
 // on its own.
-func (d *Dispatcher) statusesFromFiles(members []*v1.Pod) []commonIL.PodStatus {
+func (d *Executor) statusesFromFiles(members []*v1.Pod) []commonIL.PodStatus {
 	out := make([]commonIL.PodStatus, 0, len(members))
 	for _, m := range members {
 		_, workDir := d.memberDirs(m)
@@ -794,7 +850,7 @@ func templateExposesPorts(t v1.PodTemplateSpec) bool {
 
 // syncShadow keeps the workload's shadow in step with the job: one Ensure per
 // poll while it runs on a known node, one more with Terminal set once it ended.
-func (d *Dispatcher) syncShadow(ctx context.Context, rec *workloadRecord, st JobStatus) {
+func (d *Executor) syncShadow(ctx context.Context, rec *workloadRecord, st JobStatus) {
 	cfg := d.config()
 	terminal := isTerminalJobState(st.State)
 	d.mu.Lock()
@@ -802,7 +858,7 @@ func (d *Dispatcher) syncShadow(ctx context.Context, rec *workloadRecord, st Job
 	if current && terminal && rec.Terminal != st.State {
 		rec.Terminal = st.State
 		if err := d.saveRecord(rec); err != nil {
-			log.G(d.Sidecar.Ctx).Warning("dispatch: cannot record the end of workload ", rec.Request.WorkloadUID, ": ", err)
+			log.G(d.Sidecar.Ctx).Warning("executor: cannot record the end of workload ", rec.Request.WorkloadUID, ": ", err)
 		}
 	}
 	shadowDone := rec.ShadowTerminal
@@ -813,7 +869,7 @@ func (d *Dispatcher) syncShadow(ctx context.Context, rec *workloadRecord, st Job
 	ps := rec.Request.PodSets[0]
 	reverse, aerr := d.reverseTunnel(rec.Request)
 	if aerr != nil {
-		log.G(d.Sidecar.Ctx).Warning("dispatch: shadow of workload ", rec.Request.WorkloadUID, " without its reverse tunnel: ", aerr.msg)
+		log.G(d.Sidecar.Ctx).Warning("executor: shadow of workload ", rec.Request.WorkloadUID, " without its reverse tunnel: ", aerr.msg)
 	}
 	if !templateExposesPorts(ps.Template) && reverse == nil && !cfg.Shadow.AlwaysShadowEnabled() {
 		return
@@ -836,7 +892,7 @@ func (d *Dispatcher) syncShadow(ctx context.Context, rec *workloadRecord, st Job
 	}
 	ref, err := d.Shadow.Ensure(ctx, spec)
 	if err != nil {
-		log.G(d.Sidecar.Ctx).Warning("dispatch: shadow of workload ", spec.WorkloadUID, ": ", err)
+		log.G(d.Sidecar.Ctx).Warning("executor: shadow of workload ", spec.WorkloadUID, ": ", err)
 		return
 	}
 	d.mu.Lock()
@@ -852,13 +908,13 @@ func (d *Dispatcher) syncShadow(ctx context.Context, rec *workloadRecord, st Job
 	}
 	if changed {
 		if err := d.saveRecord(rec); err != nil {
-			log.G(d.Sidecar.Ctx).Warning("dispatch: cannot record the shadow of workload ", spec.WorkloadUID, ": ", err)
+			log.G(d.Sidecar.Ctx).Warning("executor: cannot record the shadow of workload ", spec.WorkloadUID, ": ", err)
 		}
 	}
 }
 
 // JobDeleteHandler is DELETE /jobs/{workloadUID}.
-func (d *Dispatcher) JobDeleteHandler(w http.ResponseWriter, r *http.Request) {
+func (d *Executor) JobDeleteHandler(w http.ResponseWriter, r *http.Request) {
 	if !d.authorize(w, r) {
 		return
 	}
@@ -875,15 +931,19 @@ func (d *Dispatcher) JobDeleteHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // deleteWorkload cancels the workload's job unless it ended, removes its shadow,
-// its members' directories and its record. A workload with no record only has
+// its stage Jobs, its members' directories and its record. A workload with no record only has
 // its shadow removed. On an error the record is kept, so the call can be repeated.
-func (d *Dispatcher) deleteWorkload(ctx context.Context, uid string) *apiError {
+func (d *Executor) deleteWorkload(ctx context.Context, uid string) *apiError {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	rec := d.records[uid]
 	if rec == nil {
 		if err := d.shadowManager().Delete(ctx, uid); err != nil {
 			return transientError("deleting the shadow of workload %s: %v", uid, err)
+		}
+		// A workload whose stage-in failed or still runs has no record.
+		if err := d.deleteStageJobs(ctx, uid); err != nil {
+			return transientError("deleting the stage Jobs of workload %s: %v", uid, err)
 		}
 		return nil
 	}
@@ -897,11 +957,14 @@ func (d *Dispatcher) deleteWorkload(ctx context.Context, uid string) *apiError {
 	if err := d.shadowManager().Delete(ctx, uid); err != nil {
 		return transientError("deleting the shadow of workload %s: %v", uid, err)
 	}
+	if err := d.deleteStageJobs(ctx, uid); err != nil {
+		return transientError("deleting the stage Jobs of workload %s: %v", uid, err)
+	}
 	d.removeMembers(ctx, memberPods(rec))
 	if err := os.Remove(d.recordPath(uid)); err != nil && !os.IsNotExist(err) {
-		log.G(d.Sidecar.Ctx).Warning("dispatch: cannot remove the record of workload ", uid, ": ", err)
+		log.G(d.Sidecar.Ctx).Warning("executor: cannot remove the record of workload ", uid, ": ", err)
 	}
 	delete(d.records, uid)
-	log.G(d.Sidecar.Ctx).Info("dispatch: workload ", uid, " deleted (Slurm job ", rec.JobID, ")")
+	log.G(d.Sidecar.Ctx).Info("executor: workload ", uid, " deleted (Slurm job ", rec.JobID, ")")
 	return nil
 }

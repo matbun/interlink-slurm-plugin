@@ -10,8 +10,8 @@ import (
 	"github.com/containerd/containerd/log"
 )
 
-func (d *Dispatcher) recordPath(uid string) string {
-	return filepath.Join(d.config().Dispatch.StateDir, uid+".json")
+func (d *Executor) recordPath(uid string) string {
+	return filepath.Join(d.config().Executor.StateDir, uid+".json")
 }
 
 // saveRecord writes the record through a temporary file. The previous version is
@@ -19,8 +19,8 @@ func (d *Dispatcher) recordPath(uid string) string {
 // volume) a rename onto an existing file fails on the server while the mount
 // reports success. A crash in between leaves only the temporary file, which
 // loadRecords takes.
-func (d *Dispatcher) saveRecord(rec *workloadRecord) error {
-	dir := d.config().Dispatch.StateDir
+func (d *Executor) saveRecord(rec *workloadRecord) error {
+	dir := d.config().Executor.StateDir
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
@@ -40,10 +40,10 @@ func (d *Dispatcher) saveRecord(rec *workloadRecord) error {
 }
 
 // loadRecords reads every record of StateDir. An unreadable one is skipped.
-func (d *Dispatcher) loadRecords() error {
-	dir := d.config().Dispatch.StateDir
+func (d *Executor) loadRecords() error {
+	dir := d.config().Executor.StateDir
 	if dir == "" {
-		return fmt.Errorf("Dispatch.StateDir is empty")
+		return fmt.Errorf("Executor.StateDir is empty")
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
@@ -62,7 +62,7 @@ func (d *Dispatcher) loadRecords() error {
 		// remove (see saveRecord): it is the newest version.
 		if base, ok := strings.CutSuffix(name, ".tmp"); ok && strings.HasSuffix(base, ".json") && !names[base] {
 			if err := os.Rename(filepath.Join(dir, name), filepath.Join(dir, base)); err != nil {
-				log.G(d.Sidecar.Ctx).Warning("dispatch: cannot restore record ", name, ": ", err)
+				log.G(d.Sidecar.Ctx).Warning("executor: cannot restore record ", name, ": ", err)
 				continue
 			}
 			name = base
@@ -72,16 +72,16 @@ func (d *Dispatcher) loadRecords() error {
 		}
 		raw, err := os.ReadFile(filepath.Join(dir, name))
 		if err != nil {
-			log.G(d.Sidecar.Ctx).Warning("dispatch: cannot read record ", name, ": ", err)
+			log.G(d.Sidecar.Ctx).Warning("executor: cannot read record ", name, ": ", err)
 			continue
 		}
 		var rec workloadRecord
 		if err := json.Unmarshal(raw, &rec); err != nil || len(rec.Request.PodSets) != 1 || rec.Request.WorkloadUID+".json" != name {
-			log.G(d.Sidecar.Ctx).Warning("dispatch: skipping invalid record ", name, ": ", err)
+			log.G(d.Sidecar.Ctx).Warning("executor: skipping invalid record ", name, ": ", err)
 			continue
 		}
 		d.records[rec.Request.WorkloadUID] = &rec
 	}
-	log.G(d.Sidecar.Ctx).Infof("dispatch: %d workload record(s) loaded from %s", len(d.records), dir)
+	log.G(d.Sidecar.Ctx).Infof("executor: %d workload record(s) loaded from %s", len(d.records), dir)
 	return nil
 }

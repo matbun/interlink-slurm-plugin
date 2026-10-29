@@ -18,16 +18,16 @@ import (
 
 func shadowBlock() ShadowConfig {
 	return ShadowConfig{
-		Enabled:    true,
-		AgentImage: "registry.example.org/agent:test",
-		AgentURL:   "http://interlink-agent:8000",
-		KeySecret:  "hpc-a-tunnel-key",
+		Enabled:       true,
+		ExecutorImage: "registry.example.org/executor:test",
+		ExecutorURL:   "http://kueue-offload-executor:8000",
+		KeySecret:     "hpc-a-tunnel-key",
 	}
 }
 
 func TestShadowConfigTakesSiteDefaults(t *testing.T) {
 	c := SlurmConfig{
-		Sites:  map[string]SiteConfig{dispatchSite: {LoginHost: "login.hpc-a.example.org", User: "alice", Port: 2222}},
+		Sites:  map[string]SiteConfig{executorSite: {LoginHost: "login.hpc-a.example.org", User: "alice", Port: 2222}},
 		Shadow: shadowBlock(),
 	}
 	cfg := c.shadowConfig()
@@ -43,26 +43,26 @@ func TestShadowConfigTakesSiteDefaults(t *testing.T) {
 	}
 }
 
-func TestValidateDispatchConfigChecksShadow(t *testing.T) {
-	t.Setenv(shadow.AgentImageEnv, "")
+func TestValidateExecutorConfigChecksShadow(t *testing.T) {
+	t.Setenv(shadow.ExecutorImageEnv, "")
 	base := func() SlurmConfig {
 		return SlurmConfig{
 			DataRootFolder: "/data/",
-			Dispatch:       DispatchConfig{Enabled: true, Namespace: dispatchNS, Auth: DispatchAuthConfig{Mode: DispatchAuthNetwork}},
-			Sites: map[string]SiteConfig{dispatchSite: {
-				LoginHost: "login.hpc-a.example.org", User: "alice", AllowedAccounts: []string{dispatchAccount},
+			Executor:       ExecutorConfig{Enabled: true, Namespace: executorNS, Auth: ExecutorAuthConfig{Mode: ExecutorAuthNetwork}},
+			Sites: map[string]SiteConfig{executorSite: {
+				LoginHost: "login.hpc-a.example.org", User: "alice", AllowedAccounts: []string{executorAccount},
 			}},
 			Shadow: shadowBlock(),
 		}
 	}
 	c := base()
-	if err := validateDispatchConfig(&c); err != nil {
+	if err := validateExecutorConfig(&c); err != nil {
 		t.Fatalf("valid Shadow block refused: %v", err)
 	}
 
 	bad := map[string]func(*SlurmConfig){
-		"no agent URL":         func(c *SlurmConfig) { c.Shadow.AgentURL = "" },
-		"no agent image":       func(c *SlurmConfig) { c.Shadow.AgentImage = "" },
+		"no executor URL":      func(c *SlurmConfig) { c.Shadow.ExecutorURL = "" },
+		"no executor image":    func(c *SlurmConfig) { c.Shadow.ExecutorImage = "" },
 		"no key Secret":        func(c *SlurmConfig) { c.Shadow.KeySecret = "" },
 		"bad forward mode":     func(c *SlurmConfig) { c.Shadow.ForwardMode = "socks" },
 		"bad node wait":        func(c *SlurmConfig) { c.Shadow.NodeWaitTimeout = "soon" },
@@ -71,24 +71,24 @@ func TestValidateDispatchConfigChecksShadow(t *testing.T) {
 	for name, mutate := range bad {
 		c := base()
 		mutate(&c)
-		if err := validateDispatchConfig(&c); err == nil {
+		if err := validateExecutorConfig(&c); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
 	}
 
-	t.Setenv(shadow.AgentImageEnv, "registry.example.org/agent:env")
+	t.Setenv(shadow.ExecutorImageEnv, "registry.example.org/executor:env")
 	c = base()
-	c.Shadow.AgentImage = ""
-	if err := validateDispatchConfig(&c); err != nil {
-		t.Fatalf("AgentImage from %s refused: %v", shadow.AgentImageEnv, err)
+	c.Shadow.ExecutorImage = ""
+	if err := validateExecutorConfig(&c); err != nil {
+		t.Fatalf("ExecutorImage from %s refused: %v", shadow.ExecutorImageEnv, err)
 	}
 }
 
-// TestDispatchWithShadowManager runs a workload through the agent API with the
+// TestExecutorWithShadowManager runs a workload through the executor API with the
 // real shadow manager on a fake cluster: the shadow appears once the job runs,
 // loses its tunnel when the job ends, and goes with DELETE.
-func TestDispatchWithShadowManager(t *testing.T) {
-	e := newDispatchEnv(t)
+func TestExecutorWithShadowManager(t *testing.T) {
+	e := newExecutorEnv(t)
 	e.d.Sidecar.Config.Shadow = shadowBlock()
 	m, err := NewShadowManager(e.kube, e.d.Sidecar.Config)
 	if err != nil {
@@ -96,10 +96,10 @@ func TestDispatchWithShadowManager(t *testing.T) {
 	}
 	e.d.Shadow = m
 	ctx := context.Background()
-	deployments := e.kube.AppsV1().Deployments(dispatchNS)
-	services := e.kube.CoreV1().Services(dispatchNS)
-	configMaps := e.kube.CoreV1().ConfigMaps(dispatchNS)
-	selector := metav1.ListOptions{LabelSelector: shadow.LabelShadowOf + "=" + dispatchWorkload}
+	deployments := e.kube.AppsV1().Deployments(executorNS)
+	services := e.kube.CoreV1().Services(executorNS)
+	configMaps := e.kube.CoreV1().ConfigMaps(executorNS)
+	selector := metav1.ListOptions{LabelSelector: shadow.LabelShadowOf + "=" + executorWorkload}
 
 	req := submitRequest(1)
 	req.PodSets[0].Template.Spec.Containers[0].Ports = []v1.ContainerPort{{ContainerPort: 8888}}
@@ -123,14 +123,14 @@ func TestDispatchWithShadowManager(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if dep.Labels[shadow.LabelShadowOf] != dispatchWorkload {
+	if dep.Labels[shadow.LabelShadowOf] != executorWorkload {
 		t.Errorf("Deployment labels: %v", dep.Labels)
 	}
 	forward, logs := shadowContainers(t, dep)
 	if !strings.Contains(strings.Join(forward.Args, " ")+strings.Join(forward.Command, " "), "alice@login.hpc-a.example.org") {
 		t.Errorf("ssh-forward does not reach the site's login node as its user:\n%v %v", forward.Command, forward.Args)
 	}
-	if logs.Image != "registry.example.org/agent:test" || !strings.Contains(strings.Join(logs.Command, " "), "--workload "+dispatchWorkload) {
+	if logs.Image != "registry.example.org/executor:test" || !strings.Contains(strings.Join(logs.Command, " "), "--workload "+executorWorkload) {
 		t.Errorf("job-logs: image %s, command %v", logs.Image, logs.Command)
 	}
 	if _, err := services.Get(ctx, st.Shadow.Service, metav1.GetOptions{}); err != nil {
@@ -144,7 +144,7 @@ func TestDispatchWithShadowManager(t *testing.T) {
 		t.Fatalf("node ConfigMap: %v", cm.Data)
 	}
 
-	raw, err := os.ReadFile(e.d.recordPath(dispatchWorkload))
+	raw, err := os.ReadFile(e.d.recordPath(executorWorkload))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,7 +156,7 @@ func TestDispatchWithShadowManager(t *testing.T) {
 	}
 
 	e.setState("CD None", "0 CD")
-	if err := os.WriteFile(e.memberDir(0)+"/run-"+dispatchCtn+".status", []byte("0\n"), 0o600); err != nil {
+	if err := os.WriteFile(e.memberDir(0)+"/run-"+executorCtn+".status", []byte("0\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	st = e.jobStatus()
@@ -174,7 +174,7 @@ func TestDispatchWithShadowManager(t *testing.T) {
 		t.Fatalf("logs-only shadow runs %s", names)
 	}
 
-	if rec := e.do(http.MethodDelete, "/jobs/"+dispatchWorkload, nil); rec.Code != http.StatusNoContent {
+	if rec := e.do(http.MethodDelete, "/jobs/"+executorWorkload, nil); rec.Code != http.StatusNoContent {
 		t.Fatalf("DELETE = %d %s", rec.Code, rec.Body.String())
 	}
 	if list, _ := deployments.List(ctx, selector); len(list.Items) != 0 {

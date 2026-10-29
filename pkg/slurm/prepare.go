@@ -2014,6 +2014,33 @@ func deleteContainer(ctx context.Context, config SlurmConfig, podUID string, jid
 	return removeJobFilesWithRetry(ctx, span, podUID, jid, path)
 }
 
+// removeStaleFiles deletes what dir holds beyond the files about to be written, which
+// are then overwritten in place. Removing the whole folder first, as the plugin did,
+// fails on a job directory served over SFTP when another container of the same pod
+// wrote that folder a moment before: the listing the removal works from does not show
+// those files yet, and the folder is not empty.
+func removeStaleFiles(dir string, files map[string][]byte) error {
+	keep := map[string]bool{}
+	for k := range files {
+		keep[strings.SplitN(filepath.ToSlash(filepath.Clean(k)), "/", 2)[0]] = true
+	}
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if !keep[e.Name()] {
+			if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // For simple volume type like configMap, secret, projectedVolumeMap.
 func mountDataSimpleVolume(
 	Ctx context.Context,
@@ -2032,14 +2059,14 @@ func mountDataSimpleVolume(
 	var volumesHostToContainerPaths []string
 	var envVarNames []string
 
-	err := os.RemoveAll(path + "/" + volumeType + "/" + volumeMount.Name)
+	podVolumeDir := filepath.Join(path, volumeType, volumeMount.Name)
+	err := removeStaleFiles(podVolumeDir, mountDataFiles)
 	if err != nil {
-		log.G(Ctx).Error("Unable to delete root folder")
+		log.G(Ctx).Error("Unable to clean the volume folder ", podVolumeDir)
 		return []string{}, nil, err
 	}
 
 	log.G(Ctx).Info("--- Mounting ", volumeType, ": "+volumeMount.Name)
-	podVolumeDir := filepath.Join(path, volumeType, volumeMount.Name)
 
 	for key := range mountDataFiles {
 		fullPath := filepath.Join(podVolumeDir, key)

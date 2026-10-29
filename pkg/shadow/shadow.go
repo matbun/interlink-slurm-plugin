@@ -1,8 +1,8 @@
-// Package shadow renders and maintains the shadow of a dispatched job: a Deployment
+// Package shadow renders and maintains the shadow of an offloaded job: a Deployment
 // in the job's namespace that tunnels the job's exposed ports from the cluster to
 // the compute node over SSH and streams the job's logs, plus the Service in front
 // of the ports and the ConfigMap telling the tunnel which node to reach. It is the
-// virtual kubelet's SSH shadow, moved into the agent with its template intact.
+// virtual kubelet's SSH shadow, moved into the executor with its template intact.
 package shadow
 
 import (
@@ -47,7 +47,7 @@ const (
 // shadow is not deleted yet, or an object somebody else created.
 var ErrNameTaken = errors.New("shadow name taken")
 
-// Spec is what the agent knows of a job when it ensures its shadow.
+// Spec is what the executor knows of a job when it ensures its shadow.
 type Spec struct {
 	WorkloadUID  string
 	WorkloadName string // the owner's name, base of the shadow's resource names
@@ -133,7 +133,7 @@ func (m *manager) Ensure(ctx context.Context, spec Spec) (Ref, error) {
 	case spec.WorkloadName == "":
 		return Ref{}, fmt.Errorf("shadow of workload %q: no workload name", spec.WorkloadUID)
 	case spec.Namespace != m.namespace:
-		return Ref{}, fmt.Errorf("shadow of %s/%s: this agent serves namespace %s only", spec.Namespace, spec.WorkloadName, m.namespace)
+		return Ref{}, fmt.Errorf("shadow of %s/%s: this executor serves namespace %s only", spec.Namespace, spec.WorkloadName, m.namespace)
 	}
 	if errs := validation.IsValidLabelValue(spec.WorkloadUID); spec.WorkloadUID == "" || len(errs) > 0 {
 		return Ref{}, fmt.Errorf("shadow of %s/%s: invalid workload UID %q", spec.Namespace, spec.WorkloadName, spec.WorkloadUID)

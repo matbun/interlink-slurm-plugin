@@ -38,7 +38,7 @@ func TestRunLogsCommandReconnectsThenIdles(t *testing.T) {
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
-		if q.Get("workloadUID") != dispatchWorkload || q.Get("follow") != "true" || q.Get("container") != dispatchCtn {
+		if q.Get("workloadUID") != executorWorkload || q.Get("follow") != "true" || q.Get("container") != executorCtn {
 			http.Error(w, "bad query "+r.URL.RawQuery, http.StatusBadRequest)
 			return
 		}
@@ -57,7 +57,7 @@ func TestRunLogsCommandReconnectsThenIdles(t *testing.T) {
 	var stdout, stderr syncBuffer
 	done := make(chan error, 1)
 	go func() {
-		done <- RunLogsCommand(ctx, []string{"--agent", srv.URL + "/", "--workload", dispatchWorkload, "--container", dispatchCtn, "--follow"}, &stdout, &stderr)
+		done <- RunLogsCommand(ctx, []string{"--executor", srv.URL + "/", "--workload", executorWorkload, "--container", executorCtn, "--follow"}, &stdout, &stderr)
 	}()
 
 	want := "line1\n" + LogsReconnectBanner + "\nline1\nline2\n"
@@ -90,13 +90,13 @@ func TestRunLogsCommandWithoutFollowReturns(t *testing.T) {
 	}))
 	defer srv.Close()
 	var stdout, stderr syncBuffer
-	if err := RunLogsCommand(context.Background(), []string{"--agent", srv.URL, "--workload", dispatchWorkload}, &stdout, &stderr); err != nil {
+	if err := RunLogsCommand(context.Background(), []string{"--executor", srv.URL, "--workload", executorWorkload}, &stdout, &stderr); err != nil {
 		t.Fatal(err)
 	}
 	if stdout.String() != "all\n" {
 		t.Fatalf("stdout = %q", stdout.String())
 	}
-	if err := RunLogsCommand(context.Background(), []string{"--agent", srv.URL}, &stdout, &stderr); err == nil {
+	if err := RunLogsCommand(context.Background(), []string{"--executor", srv.URL}, &stdout, &stderr); err == nil {
 		t.Fatal("accepted a call without --workload")
 	}
 }

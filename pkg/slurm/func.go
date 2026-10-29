@@ -296,13 +296,13 @@ func NewSlurmConfig() (SlurmConfig, error) {
 			log.G(context.Background()).Infof("Per-pod socket directories under: %s", SlurmConfigInst.SocketDirRoot)
 		}
 
-		if err := validateDispatchConfig(&SlurmConfigInst); err != nil {
+		if err := validateExecutorConfig(&SlurmConfigInst); err != nil {
 			log.G(context.Background()).Error(err)
 			return SlurmConfig{}, err
 		}
-		if SlurmConfigInst.Dispatch.Enabled {
-			site, _ := SlurmConfigInst.DispatchSite()
-			log.G(context.Background()).Infof("Dispatch agent for namespace %s, site %s", SlurmConfigInst.Dispatch.Namespace, site)
+		if SlurmConfigInst.Executor.Enabled {
+			site, _ := SlurmConfigInst.ExecutorSite()
+			log.G(context.Background()).Infof("Executor for namespace %s, site %s", SlurmConfigInst.Executor.Namespace, site)
 		}
 	}
 	return SlurmConfigInst, nil
