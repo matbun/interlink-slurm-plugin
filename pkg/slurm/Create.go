@@ -268,6 +268,9 @@ func (h *SidecarHandler) SubmitHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		_, err = pathFile.Write([]byte(data.JobScript))
+		if errClose := pathFile.Close(); err == nil {
+			err = errClose
+		}
 		if err != nil {
 			log.G(h.Ctx).Error("Unable to write to file ", workDir, "/jobScript.sh")
 			log.G(h.Ctx).Error(err)
