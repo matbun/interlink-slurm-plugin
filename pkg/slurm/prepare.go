@@ -2116,7 +2116,6 @@ func deleteContainer(ctx context.Context, config SlurmConfig, podUID string, jid
 	return removeJobFilesWithRetry(ctx, span, podUID, jid, path)
 }
 
-// For simple volume type like configMap, secret, projectedVolumeMap.
 // enrootMount is the --mount argument of enroot start for host path src at dst. enroot reads
 // it as an fstab entry with ':' for spaces: src:dst is a writable bind mount, but a third field
 // is the filesystem type, so "src:dst:ro" fails to mount and with "src:dst:rw" nothing can be
@@ -2128,6 +2127,7 @@ func enrootMount(src, dst string, readOnly bool) string {
 	return src + ":" + dst
 }
 
+// For simple volume type like configMap, secret, projectedVolumeMap.
 func mountDataSimpleVolume(
 	Ctx context.Context,
 	runtime string,
