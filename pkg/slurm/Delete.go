@@ -1,6 +1,7 @@
 package slurm
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -48,6 +49,26 @@ func (h *SidecarHandler) StopHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := h.deletePod(spanCtx, pod); err != nil {
+		statusCode = http.StatusInternalServerError
+		h.handleError(spanCtx, w, statusCode, err)
+		return
+	}
+
+	commonIL.SetDurationSpan(start, span, commonIL.WithHTTPReturnCode(statusCode))
+
+	w.WriteHeader(statusCode)
+	if statusCode != http.StatusOK {
+		w.Write([]byte("Some errors occurred deleting containers. Check Slurm Sidecar's logs"))
+	} else {
+		w.Write([]byte("All containers for submitted Pods have been deleted"))
+	}
+}
+
+// deletePod cancels the pod's job (the last member of a gang cancels the shared
+// one) and removes its directories.
+func (h *SidecarHandler) deletePod(spanCtx context.Context, pod *v1.Pod) error {
+	span := trace.SpanFromContext(spanCtx)
 	filesPath := h.Config.DataRootFolder + pod.Namespace + "-" + string(pod.UID)
 
 	// Drop this pod from its gang buffer (if any) before deleting the container.
@@ -89,17 +110,13 @@ func (h *SidecarHandler) StopHandler(w http.ResponseWriter, r *http.Request) {
 	jid, scancelErr := scancelDecideAndRemoveJID(spanCtx, h.Config, string(pod.UID), h.JIDs)
 	h.GangMu.Unlock()
 	if scancelErr != nil {
-		statusCode = http.StatusInternalServerError
-		h.handleError(spanCtx, w, statusCode, scancelErr)
-		return
+		return scancelErr
 	}
 
 	// Filesystem cleanup runs unlocked.
-	err = removeJobFilesWithRetry(spanCtx, span, string(pod.UID), jid, containerDeletePath)
+	err := removeJobFilesWithRetry(spanCtx, span, string(pod.UID), jid, containerDeletePath)
 	if err != nil {
-		statusCode = http.StatusInternalServerError
-		h.handleError(spanCtx, w, statusCode, err)
-		return
+		return err
 	}
 
 	// The job's EXIT trap removes the socket directory, unless the job is killed
@@ -116,19 +133,10 @@ func (h *SidecarHandler) StopHandler(w http.ResponseWriter, r *http.Request) {
 		// When a separate metadata directory exists, remove it now.
 		if workDir != filesPath {
 			if err = os.RemoveAll(filesPath); err != nil {
-				statusCode = http.StatusInternalServerError
-				h.handleError(spanCtx, w, statusCode, err)
-				return
+				return err
 			}
 		}
 	}
 
-	commonIL.SetDurationSpan(start, span, commonIL.WithHTTPReturnCode(statusCode))
-
-	w.WriteHeader(statusCode)
-	if statusCode != http.StatusOK {
-		w.Write([]byte("Some errors occurred deleting containers. Check Slurm Sidecar's logs"))
-	} else {
-		w.Write([]byte("All containers for submitted Pods have been deleted"))
-	}
+	return nil
 }

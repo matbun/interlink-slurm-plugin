@@ -381,7 +381,7 @@ func produceGangSLURMScript(
 		}
 		emitSiteLauncher(&body, ordered, launcherName, config.SocketDirRoot)
 	} else {
-		emitGangPerRankLaunch(&body, ordered, n, port)
+		emitGangPerRankLaunch(&body, ordered, n, port, config.SocketDirRoot)
 	}
 
 	// --- write job.slurm -------------------------------------------------------
@@ -399,7 +399,7 @@ func produceGangSLURMScript(
 // one `srun --overlap --nodes=1 --ntasks=1` per member, a readiness barrier
 // before the workers, and DRIVER_RC = rank-0's rc as the whole-gang result. Used
 // when the pods name no site launcher.
-func emitGangPerRankLaunch(bodyPtr *strings.Builder, ordered []*BufferedMember, n, port int) {
+func emitGangPerRankLaunch(bodyPtr *strings.Builder, ordered []*BufferedMember, n, port int, socketRoot string) {
 	body := bodyPtr
 	// Track background PIDs so we can wait/teardown.
 	body.WriteString("declare -a RANK_PIDS=()\n\n")
@@ -429,8 +429,17 @@ func emitGangPerRankLaunch(bodyPtr *strings.Builder, ordered []*BufferedMember, 
 		// `module load singularity` would no-op and job.sh's bare `singularity`
 		// would exit 127 (the original bug). Coordination env is passed via srun
 		// --export below (so $head_ip resolves in the batch shell).
-		inner := "hostname -f > " + shellescape.Quote(m.FilesPath+"/compute-node") + " || true\n" +
-			"exec " + shellescape.Quote(memberScript)
+		inner := "hostname -f > " + shellescape.Quote(m.FilesPath+"/compute-node") + " || true\n"
+		// The head's pre-exec (the reverse tunnel's set-up) runs in the head's own
+		// rank, on the node its shadow reaches, with the head's socket directory.
+		// The workers' pre-exec is not run: their nodes have no tunnel end.
+		if pre := m.Pod.Annotations[preExecAnnotation]; m.Rank == 0 && strings.TrimSpace(pre) != "" {
+			if socketDir := socketDirFor(socketRoot, m.PodUID); socketDir != "" {
+				inner += "export INTERLINK_SOCKET_DIR=" + shellescape.Quote(socketDir) + "\n"
+			}
+			inner += pre + "\n"
+		}
+		inner += "exec " + shellescape.Quote(memberScript)
 		body.WriteString("# rank " + strconv.Itoa(m.Rank) + " (" + m.Role + ") pod " + m.PodUID + "\n")
 		body.WriteString("srun --overlap --nodes=1 --ntasks=1 -w \"" + node + "\" \\\n")
 		// Coordination env via srun --export: $head_ip resolves in the batch shell

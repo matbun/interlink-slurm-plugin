@@ -745,7 +745,7 @@ func createEnvFile(Ctx context.Context, config SlurmConfig, podData commonIL.Ret
 		envs = append(envs, "--mount", mountEnvs)
 	}
 
-	envfile, err := os.Create(envfilePath)
+	envfile, err := createFile(envfilePath)
 	if err != nil {
 		log.G(Ctx).Error(err)
 		return nil, nil, err
@@ -1370,7 +1370,7 @@ func produceSLURMScript(
 
 	postfix := ""
 
-	fJob, err := os.Create(path + "/job.slurm")
+	fJob, err := createFile(path + "/job.slurm")
 	if err != nil {
 		log.G(Ctx).Error("Unable to create file ", path, "/job.slurm")
 		log.G(Ctx).Error(err)
@@ -1387,7 +1387,7 @@ func produceSLURMScript(
 		log.G(Ctx).Debug("--- Created with correct permission file ", path, "/job.slurm")
 	}
 
-	f, err := os.Create(path + "/job.sh")
+	f, err := createFile(path + "/job.sh")
 	if err != nil {
 		log.G(Ctx).Error("Unable to create file ", path, "/job.sh")
 		log.G(Ctx).Error(err)
@@ -1821,12 +1821,21 @@ func SLURMBatchSubmit(Ctx context.Context, config SlurmConfig, path string) (str
 
 	if execReturn.Stderr != "" {
 		log.G(Ctx).Error("Could not run sbatch: " + execReturn.Stderr)
-		return "", errors.New(execReturn.Stderr)
+		return "", &SbatchError{Stderr: execReturn.Stderr, ExitCode: execReturn.ExitCode}
 	} else {
 		log.G(Ctx).Debug("Job submitted")
 	}
 	return string(execReturn.Stdout), nil
 }
+
+// SbatchError is an sbatch that wrote to stderr. Its text is what sbatch wrote.
+// ExitCode is 255 when ssh, not sbatch, failed.
+type SbatchError struct {
+	Stderr   string
+	ExitCode int
+}
+
+func (e *SbatchError) Error() string { return e.Stderr }
 
 // handleJidAndPodUid creates a JID file to store the Job ID of the submitted job.
 // The output parameter must be the output of SLURMBatchSubmit function and the path
@@ -1840,21 +1849,21 @@ func handleJidAndPodUid(Ctx context.Context, pod v1.Pod, JIDs *map[string]*JidSt
 		return "", err
 	}
 	jid := jidSubmitRe.FindStringSubmatch(output)
-	fJID, err := os.Create(filesPath + "/JobID.jid")
+	fJID, err := createFile(filesPath + "/JobID.jid")
 	if err != nil {
 		log.G(Ctx).Error("Can't create jid_file")
 		return "", err
 	}
 	defer fJID.Close()
 
-	fNS, err := os.Create(filesPath + "/PodNamespace.ns")
+	fNS, err := createFile(filesPath + "/PodNamespace.ns")
 	if err != nil {
 		log.G(Ctx).Error("Can't create namespace_file")
 		return "", err
 	}
 	defer fNS.Close()
 
-	fUID, err := os.Create(filesPath + "/PodUID.uid")
+	fUID, err := createFile(filesPath + "/PodUID.uid")
 	if err != nil {
 		log.G(Ctx).Error("Can't create PodUID_file")
 		return "", err

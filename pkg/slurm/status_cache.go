@@ -106,3 +106,13 @@ func resetStatusCache() {
 	defer accountCheckMu.Unlock()
 	lastAccountCheck = time.Time{}
 }
+
+// forgetStatuses drops the cached status of these pods, so the next read asks
+// squeue.
+func forgetStatuses(uids []string) {
+	statusCacheMu.Lock()
+	defer statusCacheMu.Unlock()
+	for _, uid := range uids {
+		delete(statusCache, uid)
+	}
+}

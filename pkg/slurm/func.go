@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -45,6 +46,10 @@ const socketDirNameLen = 12
 // socket path, <root>/<12 hex digits>/fwd-65535.sock, in 107 bytes.
 const maxSocketDirRootLen = 79
 
+// memberUIDPattern matches the UID /submit gives a workload's member: the
+// workload's UID, a dash and the rank.
+var memberUIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}-([0-9]{1,4})$`)
+
 // socketDirRootPattern keeps SocketDirRoot to characters that need no quoting in
 // shell and ssh arguments, and refuses elements that start with a dot.
 var socketDirRootPattern = regexp.MustCompile(`^(/[A-Za-z0-9_][A-Za-z0-9._-]*)+$`)
@@ -62,6 +67,11 @@ func socketDirFor(root, uid string) string {
 		return ""
 	}
 	name := digits[:socketDirNameLen]
+	// The members of one workload share its UID and differ in the rank only.
+	if m := memberUIDPattern.FindStringSubmatch(uid); m != nil {
+		rank, _ := strconv.Atoi(m[1])
+		name = fmt.Sprintf("%s%04d", digits[:socketDirNameLen-4], rank)
+	}
 	if strings.Trim(name, "0123456789abcdefABCDEF") != "" {
 		return ""
 	}
@@ -285,6 +295,15 @@ func NewSlurmConfig() (SlurmConfig, error) {
 			}
 			log.G(context.Background()).Infof("Per-pod socket directories under: %s", SlurmConfigInst.SocketDirRoot)
 		}
+
+		if err := validateDispatchConfig(&SlurmConfigInst); err != nil {
+			log.G(context.Background()).Error(err)
+			return SlurmConfig{}, err
+		}
+		if SlurmConfigInst.Dispatch.Enabled {
+			site, _ := SlurmConfigInst.DispatchSite()
+			log.G(context.Background()).Infof("Dispatch agent for namespace %s, site %s", SlurmConfigInst.Dispatch.Namespace, site)
+		}
 	}
 	return SlurmConfigInst, nil
 }
@@ -313,4 +332,12 @@ func GetSessionContext(r *http.Request) string {
 
 func GetSessionContextMessage(sessionContext string) string {
 	return "HTTP InterLink session " + sessionContext + ": "
+}
+
+// createFile creates or truncates a file for writing only. A job directory served
+// over SFTP (a csi-rclone volume) uploads a write-only file before Close returns;
+// a file opened read-write, as os.Create does, is uploaded after Close, and that
+// upload can land after sbatch has read the script or after its mode was set.
+func createFile(name string) (*os.File, error) {
+	return os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o666)
 }

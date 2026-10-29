@@ -146,6 +146,18 @@ func initProvider(ctx context.Context) (func(context.Context) error, error) {
 	return tracerProvider.Shutdown, nil
 }
 func main() {
+	// "logs" streams a workload's logs from an agent, for a shadow's job-logs
+	// container. It reads no plugin configuration.
+	if len(os.Args) > 1 && os.Args[1] == "logs" {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		if err := slurm.RunLogsCommand(ctx, os.Args[2:], os.Stdout, os.Stderr); err != nil && ctx.Err() == nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	logger := logrus.StandardLogger()
 
 	slurmConfig, err := slurm.NewSlurmConfig()
@@ -206,9 +218,30 @@ func main() {
 	mutex.HandleFunc("/status", SidecarAPIs.StatusHandler)
 	mutex.HandleFunc("/create", SidecarAPIs.SubmitHandler)
 	mutex.HandleFunc("/delete", SidecarAPIs.StopHandler)
-	mutex.HandleFunc("/getLogs", SidecarAPIs.GetLogsHandler)
 	mutex.HandleFunc("/system-info", SidecarAPIs.SystemInfoHandler)
 	mutex.HandleFunc("/estimate", SidecarAPIs.EstimateHandler)
+
+	if slurmConfig.Dispatch.Enabled {
+		kube, err := slurm.InClusterClient()
+		if err != nil {
+			log.G(ctx).Fatal("dispatch: no in-cluster Kubernetes client: ", err)
+		}
+		var shadows slurm.ShadowManager
+		if slurmConfig.Shadow.Enabled {
+			shadows, err = slurm.NewShadowManager(kube, slurmConfig)
+			if err != nil {
+				log.G(ctx).Fatal("dispatch: shadow: ", err)
+			}
+		}
+		dispatcher, err := slurm.NewDispatcher(&SidecarAPIs, kube, shadows)
+		if err != nil {
+			log.G(ctx).Fatal("dispatch: ", err)
+		}
+		dispatcher.RegisterRoutes(mutex)
+	} else {
+		mutex.HandleFunc("/getLogs", SidecarAPIs.GetLogsHandler)
+		mutex.HandleFunc("GET /healthz", slurm.HealthzHandler)
+	}
 
 	SidecarAPIs.CreateDirectories()
 	SidecarAPIs.LoadJIDs()

@@ -165,7 +165,6 @@ func (h *SidecarHandler) GetLogsHandler(w http.ResponseWriter, r *http.Request) 
 
 	log.G(h.Ctx).Info(sessionContextMessage, "Docker Sidecar: received GetLogs call")
 	var req commonIL.LogStruct
-	currentTime := time.Now()
 
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -178,6 +177,16 @@ func (h *SidecarHandler) GetLogsHandler(w http.ResponseWriter, r *http.Request) 
 		h.logErrorVerbose(sessionContextMessage+"error during Unmarshal() in GetLogsHandler request body", spanCtx, w, err)
 		return
 	}
+
+	h.getLogs(spanCtx, start, req, w, r, sessionContext)
+}
+
+// getLogs writes the logs req asks for to w, following them when req.Opts.Follow
+// is set. start is when the request arrived, for the span's duration.
+func (h *SidecarHandler) getLogs(spanCtx context.Context, start int64, req commonIL.LogStruct, w http.ResponseWriter, r *http.Request, sessionContext string) {
+	span := trace.SpanFromContext(spanCtx)
+	sessionContextMessage := GetSessionContextMessage(sessionContext)
+	currentTime := time.Now()
 
 	span.SetAttributes(
 		attribute.String("pod.name", req.PodName),

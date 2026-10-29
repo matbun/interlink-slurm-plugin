@@ -138,6 +138,14 @@ type SlurmConfig struct {
 	// "Europe/Madrid"), used to read `sbatch --test-only` estimates. Empty => the
 	// plugin's own time zone.
 	SiteTimeZone string `yaml:"SiteTimeZone"`
+
+	// Dispatch turns the plugin into an interlink-dispatch agent: /submit, /jobs
+	// and the workload form of /getLogs. See dispatch.go.
+	Dispatch DispatchConfig `yaml:"Dispatch"`
+	// Sites are the HPC sites the agent submits to, by name. One in this version.
+	Sites map[string]SiteConfig `yaml:"Sites"`
+	// Shadow configures the pod that carries a running job's tunnel and logs.
+	Shadow ShadowConfig `yaml:"Shadow"`
 }
 
 type CreateStruct struct {

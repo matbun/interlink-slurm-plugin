@@ -1338,3 +1338,42 @@ func TestKueuePodGroupKeys(t *testing.T) {
 		t.Fatalf("ranks do not follow the completion index: %s, %s", ordered[0].PodUID, ordered[1].PodUID)
 	}
 }
+
+// Only the head runs its pre-exec, inside its own rank and with its own socket
+// directory: the shadow reaches the head's node only.
+func TestGangHeadRunsItsPreExec(t *testing.T) {
+	dataRoot := t.TempDir() + string(os.PathSeparator)
+	config := SlurmConfig{BashPath: testBashPath, SocketDirRoot: socketTestRoot}
+	pre := map[string]string{preExecAnnotation: "echo set-up-the-tunnel"}
+	mk := func(uid, role string) *BufferedMember {
+		dir := dataRoot + "default-" + uid
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		return gangMemberFromCreate(newGangPod(uid, "g1", role, 2, pre), dir, nil, ResourceLimits{}, true, true, nil)
+	}
+	head, worker := socketTestUID, "7d1e2f30-4a5b-4c6d-8e7f-90a1b2c3d4e5"
+	entry := &GangEntry{Name: "g1", Size: 2, Members: map[string]*BufferedMember{
+		head:   mk(head, GangRoleHead),
+		worker: mk(worker, GangRoleWorker),
+	}}
+	path, err := produceGangSLURMScript(context.Background(), config, entry, assignRanks(entry.Members))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(b)
+	if n := strings.Count(script, "echo set-up-the-tunnel"); n != 1 {
+		t.Fatalf("the pre-exec runs %d times, want once\n%s", n, script)
+	}
+	rank0, rank1, _ := strings.Cut(script, "# rank 1 (")
+	if !strings.Contains(rank0, "export INTERLINK_SOCKET_DIR="+socketDirFor(socketTestRoot, head)+"\necho set-up-the-tunnel\nexec ") {
+		t.Errorf("rank 0 does not run the pre-exec with its socket directory before job.sh\n%s", rank0)
+	}
+	if strings.Contains(rank1, "set-up-the-tunnel") {
+		t.Errorf("a worker runs the pre-exec\n%s", rank1)
+	}
+}

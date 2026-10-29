@@ -1,6 +1,7 @@
 package slurm
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -41,15 +42,48 @@ func (h *SidecarHandler) SubmitHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var data commonIL.RetrievedPodData
-
-	// to be changed to commonIL.CreateStruct
-	var returnedJID CreateStruct // returnValue
-	var returnedJIDBytes []byte
 	err = json.Unmarshal(bodyBytes, &data)
 	if err != nil {
-		statusCode = http.StatusInternalServerError
 		h.handleError(spanCtx, w, http.StatusGatewayTimeout, err)
 		return
+	}
+
+	returnedJID, cerr := h.createPod(spanCtx, data)
+	if cerr != nil {
+		if !cerr.noReply {
+			h.handleError(spanCtx, w, cerr.code, cerr.err)
+		}
+		return
+	}
+
+	returnedJIDBytes, err := json.Marshal(returnedJID)
+	if err != nil {
+		statusCode = http.StatusInternalServerError
+		h.handleError(spanCtx, w, statusCode, err)
+		return
+	}
+
+	w.WriteHeader(statusCode)
+
+	commonIL.SetDurationSpan(start, span, commonIL.WithHTTPReturnCode(statusCode))
+
+	w.Write(returnedJIDBytes)
+}
+
+// createError is a failed create: the HTTP status and error SubmitHandler answers
+// with. noReply is set where SubmitHandler has always returned without writing.
+type createError struct {
+	code    int
+	err     error
+	noReply bool
+}
+
+// createPod renders the pod's job script and submits it, or buffers the pod when
+// it is a gang member. A buffered member gets an empty PodJID.
+func (h *SidecarHandler) createPod(spanCtx context.Context, data commonIL.RetrievedPodData) (CreateStruct, *createError) {
+	span := trace.SpanFromContext(spanCtx)
+	fail := func(code int, err error) (CreateStruct, *createError) {
+		return CreateStruct{}, &createError{code: code, err: err}
 	}
 
 	containers := data.Pod.Spec.InitContainers
@@ -59,18 +93,14 @@ func (h *SidecarHandler) SubmitHandler(w http.ResponseWriter, r *http.Request) {
 	workDir := getJobWorkDir(h.Config, metadata.Annotations, data.Pod.Namespace, string(data.Pod.UID))
 	socketDir := socketDirFor(h.Config.SocketDirRoot, string(data.Pod.UID))
 
-	if err = os.MkdirAll(filesPath, 0o755); err != nil {
-		statusCode = http.StatusInternalServerError
-		h.handleError(spanCtx, w, statusCode, err)
-		return
+	if err := os.MkdirAll(filesPath, 0o755); err != nil {
+		return fail(http.StatusInternalServerError, err)
 	}
 	// Resolve flavor to apply default CPU and memory
 	flavor, err := resolveFlavor(spanCtx, h.Config, metadata, data.Pod.Spec.Containers)
 	if err != nil {
 		log.G(h.Ctx).Error("Failed to resolve flavor: ", err)
-		statusCode = http.StatusInternalServerError
-		h.handleError(spanCtx, w, statusCode, err)
-		return
+		return fail(http.StatusInternalServerError, err)
 	}
 
 	var runtime_command_pod []ContainerCommand
@@ -137,10 +167,8 @@ func (h *SidecarHandler) SubmitHandler(w http.ResponseWriter, r *http.Request) {
 		mounts, err := prepareMounts(spanCtx, h.Config, &data, &container, workDir)
 		log.G(h.Ctx).Debug(mounts)
 		if err != nil {
-			statusCode = http.StatusInternalServerError
-			h.handleError(spanCtx, w, http.StatusGatewayTimeout, err)
 			os.RemoveAll(filesPath)
-			return
+			return fail(http.StatusGatewayTimeout, err)
 		}
 
 		// prepareEnvs creates a file in the working directory, that must exist. This is created at prepareMounts.
@@ -230,10 +258,8 @@ func (h *SidecarHandler) SubmitHandler(w http.ResponseWriter, r *http.Request) {
 	if workDir != filesPath {
 		if err = os.MkdirAll(workDir, os.ModePerm); err != nil {
 			log.G(h.Ctx).Error("Failed to create job working directory: ", err)
-			statusCode = http.StatusInternalServerError
-			h.handleError(spanCtx, w, statusCode, err)
 			os.RemoveAll(filesPath)
-			return
+			return fail(http.StatusInternalServerError, err)
 		}
 	}
 
@@ -246,18 +272,17 @@ func (h *SidecarHandler) SubmitHandler(w http.ResponseWriter, r *http.Request) {
 			if workDir != filesPath {
 				os.RemoveAll(workDir)
 			}
-			return
+			return CreateStruct{}, &createError{err: err, noReply: true}
 		}
 	} else {
 
-		pathFile, err := os.Create(workDir + "/jobScript.sh")
+		pathFile, err := createFile(workDir + "/jobScript.sh")
 		if err != nil {
 			log.G(h.Ctx).Error("Unable to create file ", workDir, "/jobScript.sh")
 			log.G(h.Ctx).Error(err)
 			span.AddEvent("Failed to submit the SLURM Job")
-			h.handleError(spanCtx, w, http.StatusInternalServerError, err)
 			//os.RemoveAll(filesPath)
-			return
+			return fail(http.StatusInternalServerError, err)
 		}
 
 		mode := os.FileMode(0770)
@@ -275,9 +300,8 @@ func (h *SidecarHandler) SubmitHandler(w http.ResponseWriter, r *http.Request) {
 			log.G(h.Ctx).Error("Unable to write to file ", workDir, "/jobScript.sh")
 			log.G(h.Ctx).Error(err)
 			span.AddEvent("Failed to submit the SLURM Job")
-			h.handleError(spanCtx, w, http.StatusInternalServerError, err)
 			//os.RemoveAll(filesPath)
-			return
+			return fail(http.StatusInternalServerError, err)
 		}
 		runtime_command_pod := append([]ContainerCommand{}, ContainerCommand{
 			runtimeCommand:   []string{pathFile.Name()},
@@ -298,7 +322,7 @@ func (h *SidecarHandler) SubmitHandler(w http.ResponseWriter, r *http.Request) {
 			if workDir != filesPath {
 				os.RemoveAll(workDir)
 			}
-			return
+			return CreateStruct{}, &createError{err: err, noReply: true}
 		}
 	}
 
@@ -313,18 +337,15 @@ func (h *SidecarHandler) SubmitHandler(w http.ResponseWriter, r *http.Request) {
 	if isGangPod(h.Config, metadata) {
 		size, err := gangSizeFromMeta(metadata)
 		if err != nil {
-			statusCode = http.StatusInternalServerError
-			h.handleError(spanCtx, w, statusCode, err)
 			os.RemoveAll(filesPath)
-			return
+			return fail(http.StatusInternalServerError, err)
 		}
 		member := gangMemberFromCreate(data.Pod, filesPath, runtime_command_pod, resourceLimits, isDefaultCPU, isDefaultRam, flavor)
 		gangJID, submitted, err := h.bufferGangMember(spanCtx, member, size)
 		if err != nil {
 			span.AddEvent("Failed to submit the gang SLURM Job")
-			h.handleError(spanCtx, w, http.StatusGatewayTimeout, err)
 			os.RemoveAll(filesPath)
-			return
+			return fail(http.StatusGatewayTimeout, err)
 		}
 
 		// Respond 200 either way (contract-legal):
@@ -334,42 +355,24 @@ func (h *SidecarHandler) SubmitHandler(w http.ResponseWriter, r *http.Request) {
 		//     their own Status re-polls (no VK re-Create needed).
 		if submitted {
 			span.AddEvent("Gang SLURM Job successfully submitted with ID " + gangJID)
-			returnedJID = CreateStruct{PodUID: string(data.Pod.UID), PodJID: gangJID}
-		} else {
-			span.AddEvent("Gang member buffered, awaiting quorum")
-			returnedJID = CreateStruct{PodUID: string(data.Pod.UID), PodJID: ""}
+			return CreateStruct{PodUID: string(data.Pod.UID), PodJID: gangJID}, nil
 		}
-
-		returnedJIDBytes, err = json.Marshal(returnedJID)
-		if err != nil {
-			statusCode = http.StatusInternalServerError
-			h.handleError(spanCtx, w, statusCode, err)
-			return
-		}
-		w.WriteHeader(statusCode)
-		commonIL.SetDurationSpan(start, span, commonIL.WithHTTPReturnCode(statusCode))
-		if _, err := w.Write(returnedJIDBytes); err != nil {
-			log.G(h.Ctx).Error(err)
-		}
-		return
+		span.AddEvent("Gang member buffered, awaiting quorum")
+		return CreateStruct{PodUID: string(data.Pod.UID), PodJID: ""}, nil
 	}
 
 	out, err := SLURMBatchSubmit(h.Ctx, h.Config, path)
 	if err != nil {
 		span.AddEvent("Failed to submit the SLURM Job")
-		statusCode = http.StatusInternalServerError
-		h.handleError(spanCtx, w, http.StatusGatewayTimeout, err)
 		os.RemoveAll(filesPath)
 		if workDir != filesPath {
 			os.RemoveAll(workDir)
 		}
-		return
+		return fail(http.StatusGatewayTimeout, err)
 	}
 	log.G(h.Ctx).Info(out)
 	jid, err := handleJidAndPodUid(h.Ctx, data.Pod, h.JIDs, out, filesPath, workDir)
 	if err != nil {
-		statusCode = http.StatusInternalServerError
-		h.handleError(spanCtx, w, http.StatusGatewayTimeout, err)
 		os.RemoveAll(filesPath)
 		if workDir != filesPath {
 			os.RemoveAll(workDir)
@@ -377,34 +380,16 @@ func (h *SidecarHandler) SubmitHandler(w http.ResponseWriter, r *http.Request) {
 		podUID := string(data.Pod.UID)
 		if h.JIDs != nil {
 			if _, ok := (*h.JIDs)[podUID]; ok {
-				err = deleteContainer(spanCtx, h.Config, podUID, h.JIDs, workDir)
-				if err != nil {
-					log.G(h.Ctx).Error(err)
+				if derr := deleteContainer(spanCtx, h.Config, podUID, h.JIDs, workDir); derr != nil {
+					log.G(h.Ctx).Error(derr)
 				}
 			} else {
 				log.G(h.Ctx).Info("Skipping deleteContainer cleanup because no JID was registered for pod UID " + podUID)
 			}
 		}
-		return
+		return fail(http.StatusGatewayTimeout, err)
 	}
 
 	span.AddEvent("SLURM Job successfully submitted with ID " + jid)
-	returnedJID = CreateStruct{PodUID: string(data.Pod.UID), PodJID: jid}
-
-	returnedJIDBytes, err = json.Marshal(returnedJID)
-	if err != nil {
-		statusCode = http.StatusInternalServerError
-		h.handleError(spanCtx, w, statusCode, err)
-		return
-	}
-
-	w.WriteHeader(statusCode)
-
-	commonIL.SetDurationSpan(start, span, commonIL.WithHTTPReturnCode(statusCode))
-
-	if statusCode != http.StatusOK {
-		w.Write([]byte("Some errors occurred while creating containers. Check Slurm Sidecar's logs"))
-	} else {
-		w.Write(returnedJIDBytes)
-	}
+	return CreateStruct{PodUID: string(data.Pod.UID), PodJID: jid}, nil
 }
