@@ -59,6 +59,12 @@ func (h *SidecarHandler) SubmitHandler(w http.ResponseWriter, r *http.Request) {
 	workDir := getJobWorkDir(h.Config, metadata.Annotations, data.Pod.Namespace, string(data.Pod.UID))
 	socketDir := socketDirFor(h.Config.SocketDirRoot, string(data.Pod.UID))
 
+	if err = checkEnrootOptions(h.Config, metadata); err != nil {
+		statusCode = http.StatusInternalServerError
+		h.handleError(spanCtx, w, statusCode, err)
+		return
+	}
+
 	if err = os.MkdirAll(filesPath, 0o755); err != nil {
 		statusCode = http.StatusInternalServerError
 		h.handleError(spanCtx, w, statusCode, err)

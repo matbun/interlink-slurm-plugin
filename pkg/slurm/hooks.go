@@ -358,8 +358,8 @@ const socketDirExecArgs = `${INTERLINK_SOCKET_DIR:+--bind "$INTERLINK_SOCKET_DIR
 // the flag: "--mount" for enroot, "--bind" otherwise.
 //
 // It does not go through prepareMounts, which drops every mount of a container
-// with an unsupported volume type, nor through the env file, which exists only
-// for containers with Env or EnvFrom and which enroot ignores.
+// with an unsupported volume type, nor through the env file, which singularity
+// gets only for containers with Env or EnvFrom.
 func injectSocketDir(runtimeCmd []string, runtime, dir string) []string {
 	if dir == "" || len(runtimeCmd) == 0 {
 		return runtimeCmd

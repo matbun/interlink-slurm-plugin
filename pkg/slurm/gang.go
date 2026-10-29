@@ -326,9 +326,11 @@ func produceGangSLURMScript(
 	// clobber the per-rank --env-file that carries MASTER_ADDR/RANK/WORLD_SIZE, so
 	// torch can inject NCCL_* / UCX_* env here without breaking rendezvous). The
 	// exports also stay visible to the host launcher (UCX/PMIx server side) for the
-	// MPI path. Empty/malformed pairs (no '=', empty key) are skipped.
-	if exports := gangMPIEnvExports(head.Pod.ObjectMeta); len(exports) > 0 {
-		body.WriteString("# --- HPC tuning env (slurm-job.vk.io/mpi-env -> SINGULARITYENV_*; merged into every rank) ---\n")
+	// MPI path. Empty/malformed pairs (no '=', empty key) are skipped. enroot has
+	// no such prefix: the env file of each enroot container passes every
+	// enrootGangEnvPrefix<K> it finds on the host as K instead.
+	if exports := gangMPIEnvExports(head.Pod.ObjectMeta, config.ContainerRuntime); len(exports) > 0 {
+		body.WriteString("# --- HPC tuning env (slurm-job.vk.io/mpi-env -> " + gangMPIEnvPrefix(config.ContainerRuntime) + "*; merged into every rank) ---\n")
 		for _, e := range exports {
 			body.WriteString(e + "\n")
 		}
@@ -562,7 +564,8 @@ func emitGangSocketDirs(body *strings.Builder, root string, ordered []*BufferedM
 }
 
 // gangMPIEnvExports parses the head pod's slurm-job.vk.io/mpi-env annotation
-// ("K=V;K=V") into a slice of `export SINGULARITYENV_<K>=<shellescaped V>` lines.
+// ("K=V;K=V") into a slice of `export SINGULARITYENV_<K>=<shellescaped V>` lines,
+// or `export INTERLINK_ENROOT_ENV_<K>=...` (enrootGangEnvPrefix) for enroot.
 // Empty or malformed pairs (no '=', empty key) are skipped. Returns nil when the
 // annotation is absent or yields no valid pairs.
 // isShellEnvName reports whether s is a valid POSIX shell/env variable name:
@@ -585,7 +588,7 @@ func isShellEnvName(s string) bool {
 	return true
 }
 
-func gangMPIEnvExports(metadata metav1.ObjectMeta) []string {
+func gangMPIEnvExports(metadata metav1.ObjectMeta, runtime string) []string {
 	raw := strings.TrimSpace(metadata.Annotations["slurm-job.vk.io/mpi-env"])
 	if raw == "" {
 		return nil
@@ -608,9 +611,18 @@ func gangMPIEnvExports(metadata metav1.ObjectMeta) []string {
 		if !isShellEnvName(k) {
 			continue
 		}
-		out = append(out, "export SINGULARITYENV_"+k+"="+shellescape.Quote(v))
+		out = append(out, "export "+gangMPIEnvPrefix(runtime)+k+"="+shellescape.Quote(v))
 	}
 	return out
+}
+
+// gangMPIEnvPrefix is the prefix under which the runtime passes a host variable into
+// every rank's container.
+func gangMPIEnvPrefix(runtime string) string {
+	if runtime == "enroot" {
+		return enrootGangEnvPrefix
+	}
+	return "SINGULARITYENV_"
 }
 
 // slurmJobGone classifies one squeue probe of a submitted gang's JID and
