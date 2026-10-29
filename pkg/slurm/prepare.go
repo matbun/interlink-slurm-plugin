@@ -1227,11 +1227,15 @@ func prepareMounts(
 			case "enroot":
 				mountedDataSB.WriteString(" --mount ")
 			}
-			mountedDataSB.WriteString(hostPath + ":" + containerPath)
+			if config.ContainerRuntime == "enroot" {
+				mountedDataSB.WriteString(enrootMount(hostPath, containerPath, volumeMount.ReadOnly))
+			} else {
+				mountedDataSB.WriteString(hostPath + ":" + containerPath)
 
-			// if the read-only flag is set, we add it to the mountedDataSB
-			if volumeMount.ReadOnly {
-				mountedDataSB.WriteString(":ro")
+				// if the read-only flag is set, we add it to the mountedDataSB
+				if volumeMount.ReadOnly {
+					mountedDataSB.WriteString(":ro")
+				}
 			}
 
 		default:
@@ -2113,8 +2117,20 @@ func deleteContainer(ctx context.Context, config SlurmConfig, podUID string, jid
 }
 
 // For simple volume type like configMap, secret, projectedVolumeMap.
+// enrootMount is the --mount argument of enroot start for host path src at dst. enroot reads
+// it as an fstab entry with ':' for spaces: src:dst is a writable bind mount, but a third field
+// is the filesystem type, so "src:dst:ro" fails to mount and with "src:dst:rw" nothing can be
+// written; a read-only mount needs the whole entry.
+func enrootMount(src, dst string, readOnly bool) string {
+	if readOnly {
+		return src + ":" + dst + ":none:x-create=auto,rbind,ro"
+	}
+	return src + ":" + dst
+}
+
 func mountDataSimpleVolume(
 	Ctx context.Context,
+	runtime string,
 	container *v1.Container,
 	path string,
 	span trace.Span,
@@ -2159,6 +2175,9 @@ func mountDataSimpleVolume(
 		}
 
 		bind := fullPath + ":" + containerPath + mode + " "
+		if runtime == "enroot" {
+			bind = enrootMount(fullPath, containerPath, volumeMount.ReadOnly) + " "
+		}
 		volumesHostToContainerPaths = append(volumesHostToContainerPaths, bind)
 
 		if os.Getenv("SHARED_FS") != "true" {
@@ -2273,14 +2292,14 @@ func mountData(Ctx context.Context, config SlurmConfig, container *v1.Container,
 				mountDataConfigMapsAsBytes[key] = normalizeVolumeFileContent(retrievedDataObjectCasted.Data[key])
 			}
 			fileMode := os.FileMode(*defaultMode)
-			return mountDataSimpleVolume(Ctx, container, path, span, volumeMount, mountDataConfigMapsAsBytes, start, volumeType, fileMode)
+			return mountDataSimpleVolume(Ctx, config.ContainerRuntime, container, path, span, volumeMount, mountDataConfigMapsAsBytes, start, volumeType, fileMode)
 
 		case v1.Secret:
 			volumeType := "secrets"
 			log.G(Ctx).Debugf("in mountData() volume found: %s type: %s", volumeMount.Name, volumeType)
 
 			fileMode := os.FileMode(*volume.Secret.DefaultMode)
-			return mountDataSimpleVolume(Ctx, container, path, span, volumeMount, retrievedDataObjectCasted.Data, start, volumeType, fileMode)
+			return mountDataSimpleVolume(Ctx, config.ContainerRuntime, container, path, span, volumeMount, retrievedDataObjectCasted.Data, start, volumeType, fileMode)
 
 		case string:
 			span.AddEvent("Preparing EmptyDirs mount")
@@ -2327,8 +2346,12 @@ func mountData(Ctx context.Context, config SlurmConfig, container *v1.Container,
 				} else {
 					mode = ":rw"
 				}
-				edPath += (":" + volumeMount.MountPath + mode + " ")
-				edPaths = append(edPaths, " --bind "+edPath+" ")
+				if config.ContainerRuntime == "enroot" {
+					edPaths = append(edPaths, " --mount "+enrootMount(edPath, volumeMount.MountPath, volumeMount.ReadOnly)+" ")
+				} else {
+					edPath += (":" + volumeMount.MountPath + mode + " ")
+					edPaths = append(edPaths, " --bind "+edPath+" ")
+				}
 			}
 			duration := time.Now().UnixMicro() - start
 			span.AddEvent("Prepared emptydir mounts", trace.WithAttributes(
