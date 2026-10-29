@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	commonIL "github.com/interlink-hq/interlink/pkg/interlink"
@@ -139,5 +140,75 @@ func TestSubmitHandlerClosesJobScript(t *testing.T) {
 		if target, err := os.Readlink(filepath.Join("/proc/self/fd", fd.Name())); err == nil && strings.HasPrefix(target, workDir+"/") {
 			t.Errorf("left %s open (fd %s)", target, fd.Name())
 		}
+	}
+}
+
+// A pod whose app containers set no CPU or memory gets its flavor's CPUDefault and
+// MemoryDefault in job.slurm, not the 1 CPU / 1 MB fallback, and not the limits of an init
+// container alone.
+func TestSubmitHandlerFlavorDefaults(t *testing.T) {
+	small := v1.ResourceList{v1.ResourceCPU: resource.MustParse("1"), v1.ResourceMemory: resource.MustParse("1Gi")}
+	for _, tc := range []struct {
+		name string
+		init []v1.Container
+	}{
+		{"no limits", nil},
+		{"init container limits only", []v1.Container{{Name: "setup", Image: busyboxImage, Resources: v1.ResourceRequirements{Limits: small}}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sbatch := filepath.Join(t.TempDir(), "sbatch")
+			if err := os.WriteFile(sbatch, []byte("#!/bin/sh\necho 'Submitted batch job 42'\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			dataRoot := t.TempDir() + "/"
+			data := commonIL.RetrievedPodData{
+				Pod: v1.Pod{
+					ObjectMeta: metav1.ObjectMeta{Name: socketTestPod, Namespace: metav1.NamespaceDefault, UID: socketTestUID},
+					Spec: v1.PodSpec{
+						InitContainers: tc.init,
+						Containers:     []v1.Container{{Name: "workload", Image: busyboxImage}},
+					},
+				},
+				JobScript: "#!/bin/sh\necho hello\n",
+			}
+			body, err := json.Marshal(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			jids := map[string]*JidStruct{}
+			h := &SidecarHandler{
+				Config: SlurmConfig{
+					Sbatchpath:       sbatch,
+					ContainerRuntime: singularityRuntime,
+					SingularityPath:  singularityRuntime,
+					DataRootFolder:   dataRoot,
+					Flavors:          map[string]FlavorConfig{"small": {Name: "small", CPUDefault: 4, MemoryDefault: "2G"}},
+					DefaultFlavor:    "small",
+				},
+				JIDs: &jids,
+				Ctx:  context.Background(),
+			}
+			rec := httptest.NewRecorder()
+			h.SubmitHandler(rec, httptest.NewRequest(http.MethodPost, "/create", bytes.NewReader(body)))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("SubmitHandler() code = %d, body %q", rec.Code, rec.Body.String())
+			}
+
+			raw, err := os.ReadFile(dataRoot + metav1.NamespaceDefault + "-" + socketTestUID + "/job.slurm")
+			if err != nil {
+				t.Fatal(err)
+			}
+			script := string(raw)
+			for _, want := range []string{"#SBATCH --cpus-per-task=4\n", "#SBATCH --mem=2048\n"} {
+				if !strings.Contains(script, want) {
+					t.Errorf("job.slurm lacks %q:\n%s", want, script)
+				}
+			}
+			for _, bad := range []string{"#SBATCH --cpus-per-task=1\n", "#SBATCH --mem=1\n", "#SBATCH --mem=1024\n"} {
+				if strings.Contains(script, bad) {
+					t.Errorf("job.slurm has %q:\n%s", bad, script)
+				}
+			}
+		})
 	}
 }
