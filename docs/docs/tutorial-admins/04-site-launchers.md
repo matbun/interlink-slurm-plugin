@@ -23,12 +23,11 @@ The rank comes from `batch.kubernetes.io/job-completion-index`; the head is the 
 members until the group is complete (`GangTimeout`, default 15m), then submits one
 `sbatch --nodes=<count>`.
 
-A caller that holds the whole group can skip the buffer: `POST /createPodSets` takes
-`{"groupUID": ..., "podSets": [{"name": ..., "pods": [...]}]}`, each pod as `/create`
-receives it, and submits the same job at once. Ranks follow the order of the pods, PodSet
-after PodSet, and rank 0 is the head. The answer lists one `PodUID`/`PodJID` per pod;
-status, logs and delete stay per pod. The ping answer lists the capability
-`podset-create` when `GangSchedulingEnabled` is set.
+A caller that holds the whole group can skip the buffer: `POST /createPodGroup` takes
+`{"groupUID": ..., "pods": [...]}`, each pod as `/create` receives it, in rank order, and
+submits the same job at once; rank 0 is the head. The answer lists one `PodUID`/`PodJID` per
+pod; status, logs and delete stay per pod. The ping answer lists the capability
+`pod-group-create` when `GangSchedulingEnabled` is set.
 
 ## How the job starts: the site file
 

@@ -20,32 +20,25 @@ import (
 
 const testGroup = "wl-uid"
 
-// podSetsRequest is a group of PodSets of the given sizes, its pods numbered
-// across PodSets and labelled with the group, as the executor builds them.
-func podSetsRequest(sizes ...int) PodSetsCreateRequest {
-	req := PodSetsCreateRequest{GroupUID: testGroup}
-	rank := 0
-	for p, size := range sizes {
-		ps := PodSetData{Name: "ps" + strconv.Itoa(p)}
-		for i := 0; i < size; i++ {
-			uid := rankUID(rank)
-			ps.Pods = append(ps.Pods, commonIL.RetrievedPodData{Pod: v1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "pod-" + strconv.Itoa(rank), Namespace: testNamespace, UID: types.UID(uid),
-					Labels: map[string]string{PodGroupNameLabel: testGroup},
-				},
-				Spec: v1.PodSpec{Containers: []v1.Container{{Name: "main", Image: busyboxImage}}},
-			}})
-			rank++
-		}
-		req.PodSets = append(req.PodSets, ps)
+// podGroupRequest is a pod group of n pods in rank order, labelled with the
+// group, as the executor builds them.
+func podGroupRequest(n int) PodGroupCreateRequest {
+	req := PodGroupCreateRequest{GroupUID: testGroup}
+	for rank := 0; rank < n; rank++ {
+		req.Pods = append(req.Pods, commonIL.RetrievedPodData{Pod: v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "pod-" + strconv.Itoa(rank), Namespace: testNamespace, UID: types.UID(rankUID(rank)),
+				Labels: map[string]string{PodGroupNameLabel: testGroup},
+			},
+			Spec: v1.PodSpec{Containers: []v1.Container{{Name: "main", Image: busyboxImage}}},
+		}})
 	}
 	return req
 }
 
-// newPodSetsHandler is newHandlerWithStubs with a runtime, and an sbatch that
+// newPodGroupHandler is newHandlerWithStubs with a runtime, and an sbatch that
 // counts its calls in the returned file.
-func newPodSetsHandler(t *testing.T, sbatchBody string) (*SidecarHandler, string, string, string) {
+func newPodGroupHandler(t *testing.T, sbatchBody string) (*SidecarHandler, string, string, string) {
 	t.Helper()
 	h, dataRoot, scancelCount := newHandlerWithStubs(t, "42")
 	h.Config.ContainerRuntime = singularityRuntime
@@ -56,29 +49,29 @@ func newPodSetsHandler(t *testing.T, sbatchBody string) (*SidecarHandler, string
 	return h, dataRoot, scancelCount, sbatchCount
 }
 
-func postPodSets(t *testing.T, h *SidecarHandler, req PodSetsCreateRequest) *httptest.ResponseRecorder {
+func postPodGroup(t *testing.T, h *SidecarHandler, req PodGroupCreateRequest) *httptest.ResponseRecorder {
 	t.Helper()
 	body, err := json.Marshal(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	rec := httptest.NewRecorder()
-	h.CreatePodSetsHandler(rec, httptest.NewRequest(http.MethodPost, "/createPodSets", bytes.NewReader(body)))
+	h.CreatePodGroupHandler(rec, httptest.NewRequest(http.MethodPost, "/createPodGroup", bytes.NewReader(body)))
 	return rec
 }
 
-// rankUID is the UID podSetsRequest gives to a rank.
+// rankUID is the UID podGroupRequest gives to a rank.
 func rankUID(rank int) string { return testGroup + "-" + strconv.Itoa(rank) }
 
 // One call submits the whole group as one job, ranks in the order of the
 // request; a retried call gets the same job without a second sbatch; the
 // deletes of the members cancel the job once.
-func TestCreatePodSetsSubmitsOneJob(t *testing.T) {
-	h, dataRoot, scancelCount, sbatchCount := newPodSetsHandler(t, "echo 'Submitted batch job 42'")
-	req := podSetsRequest(1, 2)
+func TestCreatePodGroupSubmitsOneJob(t *testing.T) {
+	h, dataRoot, scancelCount, sbatchCount := newPodGroupHandler(t, "echo 'Submitted batch job 42'")
+	req := podGroupRequest(3)
 
 	for attempt := 0; attempt < 2; attempt++ {
-		rec := postPodSets(t, h, req)
+		rec := postPodGroup(t, h, req)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("attempt %d: code %d, body %q", attempt, rec.Code, rec.Body.String())
 		}
@@ -138,38 +131,38 @@ func TestCreatePodSetsSubmitsOneJob(t *testing.T) {
 	}
 }
 
-func TestCreatePodSetsRefusals(t *testing.T) {
-	otherGroup := podSetsRequest(2)
-	otherGroup.PodSets[0].Pods[1].Pod.Labels[PodGroupNameLabel] = "other"
-	sameUID := podSetsRequest(2)
-	sameUID.PodSets[0].Pods[1].Pod.UID = sameUID.PodSets[0].Pods[0].Pod.UID
-	noGroup := podSetsRequest(2)
+func TestCreatePodGroupRefusals(t *testing.T) {
+	otherGroup := podGroupRequest(2)
+	otherGroup.Pods[1].Pod.Labels[PodGroupNameLabel] = "other"
+	sameUID := podGroupRequest(2)
+	sameUID.Pods[1].Pod.UID = sameUID.Pods[0].Pod.UID
+	noGroup := podGroupRequest(2)
 	noGroup.GroupUID = ""
 
 	tests := []struct {
 		name    string
-		req     PodSetsCreateRequest
+		req     PodGroupCreateRequest
 		gangOff bool
 		buffer  bool
 		want    int
 	}{
-		{name: "gang scheduling off", req: podSetsRequest(2), gangOff: true, want: http.StatusBadRequest},
+		{name: "gang scheduling off", req: podGroupRequest(2), gangOff: true, want: http.StatusBadRequest},
 		{name: "no group UID", req: noGroup, want: http.StatusBadRequest},
-		{name: "no pods", req: PodSetsCreateRequest{GroupUID: testGroup}, want: http.StatusBadRequest},
+		{name: "no pods", req: PodGroupCreateRequest{GroupUID: testGroup}, want: http.StatusBadRequest},
 		{name: "pod of another group", req: otherGroup, want: http.StatusBadRequest},
 		{name: "two pods with one UID", req: sameUID, want: http.StatusBadRequest},
-		{name: "group buffered by /create", req: podSetsRequest(2), buffer: true, want: http.StatusServiceUnavailable},
+		{name: "group buffered by /create", req: podGroupRequest(2), buffer: true, want: http.StatusServiceUnavailable},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h, _, _, sbatchCount := newPodSetsHandler(t, "echo 'Submitted batch job 42'")
+			h, _, _, sbatchCount := newPodGroupHandler(t, "echo 'Submitted batch job 42'")
 			h.Config.GangSchedulingEnabled = !tt.gangOff
 			if tt.buffer {
 				if _, ok, err := bufferPod(t, h, newGangPod("uid-a", testGroup, "head", 2, nil), 2); err != nil || ok {
 					t.Fatalf("buffer: ok=%v err=%v", ok, err)
 				}
 			}
-			if rec := postPodSets(t, h, tt.req); rec.Code != tt.want {
+			if rec := postPodGroup(t, h, tt.req); rec.Code != tt.want {
 				t.Fatalf("code %d, want %d; body %q", rec.Code, tt.want, rec.Body.String())
 			}
 			if n := countLines(t, sbatchCount); n != 0 {
@@ -181,7 +174,7 @@ func TestCreatePodSetsRefusals(t *testing.T) {
 
 // A refused sbatch answers as /create does and leaves nothing behind, so a
 // later call starts afresh.
-func TestCreatePodSetsSbatchRefused(t *testing.T) {
+func TestCreatePodGroupSbatchRefused(t *testing.T) {
 	tests := []struct {
 		name   string
 		stderr string
@@ -192,8 +185,8 @@ func TestCreatePodSetsSbatchRefused(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h, dataRoot, _, _ := newPodSetsHandler(t, "echo '"+tt.stderr+"' >&2; exit 1")
-			if rec := postPodSets(t, h, podSetsRequest(2)); rec.Code != tt.want {
+			h, dataRoot, _, _ := newPodGroupHandler(t, "echo '"+tt.stderr+"' >&2; exit 1")
+			if rec := postPodGroup(t, h, podGroupRequest(2)); rec.Code != tt.want {
 				t.Fatalf("code %d, want %d; body %q", rec.Code, tt.want, rec.Body.String())
 			}
 			for i := 0; i < 2; i++ {
@@ -206,7 +199,7 @@ func TestCreatePodSetsSbatchRefused(t *testing.T) {
 			}
 
 			h.Config.Sbatchpath = writeStubScript(t, t.TempDir(), "sbatch", "echo 'Submitted batch job 43'")
-			if rec := postPodSets(t, h, podSetsRequest(2)); rec.Code != http.StatusOK {
+			if rec := postPodGroup(t, h, podGroupRequest(2)); rec.Code != http.StatusOK {
 				t.Fatalf("retry: code %d, body %q", rec.Code, rec.Body.String())
 			}
 		})
