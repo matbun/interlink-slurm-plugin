@@ -37,12 +37,11 @@ type SidecarHandler struct {
 	JIDs   *map[string]*JidStruct
 	Ctx    context.Context
 
-	// Gang scheduling. GangTable buffers pods sharing an interlink.eu/gang-name
-	// until the gang is complete, then a single sbatch is submitted for the whole
-	// group.
+	// Gang scheduling. GangTable holds the pod groups submitted as a single
+	// sbatch for the whole group, keyed by the group's name.
 	//
 	// GangMu serializes gang-scheduling operations against each other: gang-Create
-	// vs gang-Create (buffering / quorum submission) and gang-Create vs Delete
+	// vs gang-Create (submission of a group) and gang-Create vs Delete
 	// (the refcount/last-holder decision). It does NOT make the JIDs map fully
 	// race-free: JIDs is also written by the pre-existing lockless writers in
 	// Status.go (StartTime/EndTime updates) and by the single-pod
@@ -1158,8 +1157,9 @@ func prepareMounts(
 // slurm-job.vk.io/flags annotation, the resolved UID, and the pod-spec CPU/memory
 // resources. It was extracted verbatim from produceSLURMScript so both the
 // single-pod path and the gang path (produceGangSLURMScript) share one source of
-// truth. The only new behavior is suppressDefaultMem: when true (gang path on
-// sites like BSC that reject an explicit --mem), the fallback "--mem=1" is NOT
+// truth; the mpi-flags handling, which changes the commands and not the flags,
+// stays there. The only new behavior is suppressDefaultMem: when true (gang path on
+// sites that reject an explicit --mem), the fallback "--mem=1" is NOT
 // emitted when RAM is unset. Passing false reproduces the original behavior
 // exactly.
 func buildSbatchFlags(
@@ -1167,7 +1167,6 @@ func buildSbatchFlags(
 	config SlurmConfig,
 	pod v1.Pod,
 	metadata metav1.ObjectMeta,
-	commands []ContainerCommand,
 	resourceLimits ResourceLimits,
 	isDefaultCPU bool,
 	isDefaultRam bool,
@@ -1205,20 +1204,6 @@ func buildSbatchFlags(
 			}
 
 			sbatchFlagsFromArgo = append(sbatchFlagsFromArgo, annotationFlag)
-		}
-	}
-
-	if mpiFlags, ok := metadata.Annotations["slurm-job.vk.io/mpi-flags"]; ok {
-		if mpiFlags != "true" {
-			mpi := append([]string{"mpiexec", "-np", "$SLURM_NTASKS"}, strings.Split(mpiFlags, " ")...)
-			// commands is a []ContainerCommand (value-type elements), so a
-			// `for _, cc := range commands` loop mutates a throwaway COPY and the
-			// prepended mpiexec was silently discarded (dead code). Index into the
-			// slice so the mutation lands on the real element and mpiexec is
-			// actually prepended to each container's runtime command.
-			for i := range commands {
-				commands[i].runtimeCommand = append(append([]string{}, mpi...), commands[i].runtimeCommand...)
-			}
 		}
 	}
 
@@ -1270,8 +1255,8 @@ func buildSbatchFlags(
 		sbatchFlagsFromArgo = append(sbatchFlagsFromArgo, "--mem="+strconv.FormatInt(resourceLimits.Memory/1024/1024, 10))
 	} else {
 		log.G(Ctx).Info("Using default Memory limit of 1MB")
-		// Gang path suppresses the --mem=1 fallback: on BSC an explicit --mem is
-		// rejected, and the validated 03-nodesN-ray.slurm emits no --mem at all.
+		// Gang path suppresses the --mem=1 fallback: some sites reject an
+		// explicit --mem.
 		if !memoryLimitSetFromFlags && !suppressDefaultMem {
 			sbatchFlagsFromArgo = append(sbatchFlagsFromArgo, "--mem=1")
 		}
@@ -1406,11 +1391,25 @@ func produceSLURMScript(
 
 	sbatchFlagsAsString := ""
 
+	if mpiFlags, ok := metadata.Annotations["slurm-job.vk.io/mpi-flags"]; ok {
+		if mpiFlags != "true" {
+			mpi := append([]string{"mpiexec", "-np", "$SLURM_NTASKS"}, strings.Split(mpiFlags, " ")...)
+			// commands is a []ContainerCommand (value-type elements), so a
+			// `for _, cc := range commands` loop mutates a throwaway COPY and the
+			// prepended mpiexec was silently discarded (dead code). Index into the
+			// slice so the mutation lands on the real element and mpiexec is
+			// actually prepended to each container's runtime command.
+			for i := range commands {
+				commands[i].runtimeCommand = append(append([]string{}, mpi...), commands[i].runtimeCommand...)
+			}
+		}
+	}
+
 	// Assemble the #SBATCH flags (flavor < annotations < pod-spec resources).
 	// Extracted into buildSbatchFlags so the gang path can reuse the identical
 	// assembly. suppressDefaultMem=false here keeps single-pod output byte-for-byte
 	// identical to the pre-refactor behavior.
-	sbatchFlagsFromArgo := buildSbatchFlags(Ctx, config, pod, metadata, commands, resourceLimits, isDefaultCPU, isDefaultRam, flavor, false)
+	sbatchFlagsFromArgo := buildSbatchFlags(Ctx, config, pod, metadata, resourceLimits, isDefaultCPU, isDefaultRam, flavor, false)
 
 	for _, slurmFlag := range sbatchFlagsFromArgo {
 		if slurmFlag != "" {
@@ -1951,17 +1950,25 @@ func scancelDecideAndRemoveJID(ctx context.Context, config SlurmConfig, podUID s
 	if entry := (*jids)[podUID]; entry != nil {
 		jid = entry.JID
 		if countJIDReferences(jids, jid) <= 1 {
-			if _, err := exec.Command(config.Scancelpath, jid).Output(); err != nil { //nolint:gosec // scancel from the site config, jid is the numeric job ID
-				log.G(ctx).Error(err)
+			if err := scancelJob(ctx, config, jid); err != nil {
 				return jid, err
 			}
-			log.G(ctx).Info("- Deleted Job ", jid)
 		} else {
 			log.G(ctx).Infof("- Skipping scancel of shared gang Job %s: other pods still reference it", jid)
 		}
 	}
 	removeJID(podUID, jids)
 	return jid, nil
+}
+
+// scancelJob cancels a SLURM job.
+func scancelJob(ctx context.Context, config SlurmConfig, jid string) error {
+	if _, err := exec.Command(config.Scancelpath, jid).Output(); err != nil { //nolint:gosec // scancel from the site config, jid is the numeric job ID
+		log.G(ctx).Error(err)
+		return err
+	}
+	log.G(ctx).Info("- Deleted Job ", jid)
+	return nil
 }
 
 // removeJobFilesWithRetry removes a pod's on-disk dir, retrying once after a

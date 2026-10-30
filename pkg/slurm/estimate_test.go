@@ -19,10 +19,10 @@ const testFlavor = "default"
 func TestEstimateFlags(t *testing.T) {
 	config := SlurmConfig{
 		DefaultFlavor: testFlavor,
-		Flavors:       map[string]FlavorConfig{testFlavor: {Name: testFlavor, SlurmFlags: []string{"--qos=acc_debug", "-A", "proj"}}},
+		Flavors:       map[string]FlavorConfig{testFlavor: {Name: testFlavor, SlurmFlags: []string{"--qos=debug", "-A", "proj"}}},
 	}
 	got := strings.Join(estimateFlags(config, EstimateRequest{Nodes: 2, GPUsPerNode: 4}), " ")
-	for _, want := range []string{"--test-only", "--nodes=2", "--qos=acc_debug", "-A proj", testGres4, "--wrap=true"} {
+	for _, want := range []string{"--test-only", "--nodes=2", "--qos=debug", "-A proj", testGres4, "--wrap=true"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("estimate flags %q missing %q", got, want)
 		}

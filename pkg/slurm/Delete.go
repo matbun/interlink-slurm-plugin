@@ -71,22 +71,23 @@ func (h *SidecarHandler) deletePod(spanCtx context.Context, pod *v1.Pod) error {
 	span := trace.SpanFromContext(spanCtx)
 	filesPath := h.Config.DataRootFolder + pod.Namespace + "-" + string(pod.UID)
 
-	// Drop this pod from its gang buffer (if any) before deleting the container.
+	// Drop this pod from its gang entry (if any) before deleting the container.
 	// interLink /delete is per-pod, so the N members of a gang arrive as N
-	// separate deletes. This is safe at ANY lifecycle point:
-	//   - buffered member (gang not yet submitted, so no JIDs entry): removed from
-	//     the buffer here; deleteContainer's guarded jid read skips scancel; the
-	//     GangEntry is dropped when its buffer empties.
-	//   - submitted member (shared gang JID present): still removed from the entry;
-	//     deleteContainer refcounts the shared JID and scancels only on the last
-	//     member. A no-op for non-gang pods.
+	// separate deletes. Each is removed from the entry, which is dropped once
+	// empty; the shared JID is refcounted below and scancelled only on the last
+	// member. A member still buffered by /create has no JID: nothing is
+	// cancelled. A no-op for non-gang pods.
 	h.removeGangMemberOnDelete(spanCtx, string(pod.UID))
 	// Resolve the job working directory.
 	// Priority: 1) in-memory JIDs cache  2) pod annotation (handles wiped cache)
 	workDir := getJobWorkDir(h.Config, pod.Annotations, pod.Namespace, string(pod.UID))
+	// Under GangMu: the deletes of a gang's members arrive together and remove
+	// their JIDs entries under it.
+	h.GangMu.Lock()
 	if jid, ok := (*h.JIDs)[string(pod.UID)]; ok && jid.WorkDir != "" {
 		workDir = jid.WorkDir
 	}
+	h.GangMu.Unlock()
 
 	// When the annotation "slurm-job.vk.io/no-clean-workdir" is "true" and a
 	// custom workdir is in use, preserve the job output directory after deletion.

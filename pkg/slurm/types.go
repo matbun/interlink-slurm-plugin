@@ -114,20 +114,21 @@ type SlurmConfig struct {
 	// runAsUser): a job whose account cannot write the root fails at start.
 	SocketDirRoot string `yaml:"SocketDirRoot"`
 
-	// Gang scheduling. When GangSchedulingEnabled is false (the
-	// default) the plugin behaves exactly as before: 1 Pod = 1 sbatch. When
-	// enabled, pods carrying the `interlink.eu/gang-name` annotation are
-	// BUFFERED in the plugin and submitted together as a single co-scheduled
-	// `sbatch --nodes=N` job. Pods WITHOUT that annotation always take the
-	// unchanged single-pod path, regardless of this flag.
+	// Gang scheduling. When GangSchedulingEnabled is false (the default)
+	// /createPodGroup refuses every group and the plugin behaves exactly as
+	// before: 1 Pod = 1 sbatch. When enabled, the pods of a group are submitted
+	// together as a single co-scheduled `sbatch --nodes=N` job: those sent in one
+	// /createPodGroup call, and those /create receives with Kueue's pod-group keys,
+	// which it buffers until the group is complete. Pods without the keys take
+	// the single-pod path either way.
 	GangSchedulingEnabled bool `yaml:"GangSchedulingEnabled"` // default false
-	// GangTimeout is how long an incomplete gang is buffered before being
-	// abandoned (its buffered members' dirs removed and the entry dropped).
+	// GangTimeout is how long /create buffers an incomplete group before
+	// abandoning it (its buffered members' dirs removed and the entry dropped).
 	// Parsed as a Go duration string (e.g. "10m", "30s"). Empty => 10m.
 	GangTimeout string `yaml:"GangTimeout"`
 	// SiteScriptPath is the site file (typically a mounted ConfigMap): its top level
 	// runs at the start of every gang job and its `<name>-launcher` functions start
-	// gangs whose pods carry interlink.eu/launcher: <name>. Read at each gang
+	// gangs whose head pod carries interlink.eu/launcher: <name>. Read at each gang
 	// submission, so an edit applies to the next job. Empty => /etc/interlink/site/site.sh.
 	SiteScriptPath string `yaml:"SiteScriptPath"`
 	// GPUFlag is how this site's Slurm takes the GPUs a pod requests
@@ -135,7 +136,7 @@ type SlurmConfig struct {
 	// "gpus-per-node" (--gpus-per-node=N) or "gpus" (--gpus=N).
 	GPUFlag string `yaml:"GPUFlag"`
 	// SiteTimeZone is the IANA time zone Slurm prints its times in (e.g.
-	// "Europe/Madrid"), used to read `sbatch --test-only` estimates. Empty => the
+	// "Europe/Paris"), used to read `sbatch --test-only` estimates. Empty => the
 	// plugin's own time zone.
 	SiteTimeZone string `yaml:"SiteTimeZone"`
 
@@ -150,11 +151,12 @@ type CreateStruct struct {
 	PodJID string `json:"PodJID"`
 }
 
-// Gang keys. A gang is a Kueue pod group: label kueue.x-k8s.io/pod-group-name and
-// annotation kueue.x-k8s.io/pod-group-total-count, so the group Kueue admits whole is
-// the group submitted as one job. Rank and role come from the labels the controllers
-// already set (Job completion index, Ray node type, JobSet launcher). The
-// interlink.eu/gang-* keys are still read when the Kueue ones are absent.
+// Gang keys. A gang that /create receives pod by pod is a Kueue pod group: label
+// kueue.x-k8s.io/pod-group-name and annotation kueue.x-k8s.io/pod-group-total-count,
+// so the group Kueue admits whole is the group submitted as one job. Rank and role
+// come from the labels the controllers already set (Job completion index, Ray node
+// type, JobSet launcher). The interlink.eu/gang-* keys are still read when the
+// Kueue ones are absent.
 const (
 	PodGroupNameLabel            = "kueue.x-k8s.io/pod-group-name"
 	PodGroupTotalCountAnnotation = "kueue.x-k8s.io/pod-group-total-count"
@@ -162,21 +164,23 @@ const (
 	RayNodeTypeLabel             = "ray.io/node-type"
 	JobSetReplicatedJobLabel     = "jobset.sigs.k8s.io/replicatedjob-name"
 
-	// GangNameAnnotation is the co-allocation key. All pods sharing the same
-	// value are buffered and submitted as ONE `sbatch --nodes=N` job. Its
-	// presence (with GangSchedulingEnabled) is what triggers the gang path.
+	// GangNameAnnotation names the group when PodGroupNameLabel is absent: all
+	// pods sharing the same value are buffered and submitted as ONE
+	// `sbatch --nodes=N` job.
 	GangNameAnnotation = "interlink.eu/gang-name"
-	// GangSizeAnnotation is the integer N: both the buffering quorum and the
-	// `#SBATCH --nodes=N`. Required on every gang member.
+	// GangSizeAnnotation is the integer N when PodGroupTotalCountAnnotation is
+	// absent: both the buffering quorum and the `#SBATCH --nodes=N`.
 	GangSizeAnnotation = "interlink.eu/gang-size"
 	// GangRoleAnnotation is "head" or "worker" (default "worker"). role=head is
 	// forced to rank 0.
 	GangRoleAnnotation = "interlink.eu/gang-role"
 	// GangRankAnnotation is an optional explicit rank in 0..N-1. When absent,
-	// ranks are assigned by arrival order (with head pinned to rank 0).
+	// the Job completion index is the rank, else the lowest free one in UID
+	// order (with head pinned to rank 0).
 	GangRankAnnotation = "interlink.eu/gang-rank"
 
-	// GangRoleHead / GangRoleWorker are the two recognised role values.
+	// GangRoleHead / GangRoleWorker are the two roles of a gang member; the
+	// head is rank 0.
 	GangRoleHead   = "head"
 	GangRoleWorker = "worker"
 
@@ -188,12 +192,13 @@ const (
 
 // BufferedMember holds everything produceGangSLURMScript needs to render one
 // gang member's own rank line (its already-rendered singularity/enroot runtime
-// command, its per-pod files dir for isolated logs, its role/rank, and the pod
+// command, its per-pod job dir for isolated logs, its role/rank, and the pod
 // itself for command/args). One BufferedMember == one rank on one node.
 type BufferedMember struct {
 	PodUID          string
 	Namespace       string
-	FilesPath       string // per-pod dir (DataRootFolder + ns + "-" + uid): job.sh, JobID.jid, logs
+	FilesPath       string // per-pod dir (DataRootFolder + ns + "-" + uid): JobID.jid and the other bookkeeping files
+	WorkDir         string // the pod's job dir, as /create's: job.sh, logs, status files; FilesPath unless slurm-job.vk.io/job-workdir is set
 	Role            string // GangRoleHead or GangRoleWorker
 	Rank            int    // 0..N-1; head is always 0
 	Pod             v1.Pod
@@ -204,14 +209,19 @@ type BufferedMember struct {
 	Flavor          *FlavorResolution
 }
 
-// GangEntry is the buffer for a single gang (keyed by gang-name in GangTable).
-// It accumulates members until len(Members) == Size, then submits ONE sbatch.
+// GangEntry is one gang (keyed by its name in GangTable): its members, and the
+// ONE sbatch submitted for all of them. A group that /create receives pod by pod
+// is keyed by gangKey instead, and buffered in its entry until
+// len(Members) == Size.
 type GangEntry struct {
 	Name      string
 	Size      int
 	Members   map[string]*BufferedMember // keyed by PodUID
 	JID       string                     // the shared SLURM job ID once submitted
 	Submitted bool
+	// Buffering is set while /create collects the members and no sbatch has run
+	// for them; CreatedAt is when the first one arrived.
+	Buffering bool
 	CreatedAt time.Time
 }
 
@@ -315,8 +325,8 @@ type PingResponse struct {
 	// are replaced with this list.  When absent, existing taints are left unchanged.
 	Taints *[]TaintConfig `json:"taints,omitempty"`
 	// Capabilities lists what the plugin offers beyond one job per pod, such as
-	// "pod-group". interLink's PingResponse has no such field yet; a decoder that
-	// does not know it ignores it.
+	// "pod-group-create". interLink's PingResponse has no such field yet; a decoder
+	// that does not know it ignores it.
 	Capabilities []string `json:"capabilities,omitempty"`
 }
 

@@ -3,8 +3,8 @@ package slurm
 // Pod group create.
 //
 // /createPodGroup takes the pods of one pod group in one call and submits them as one
-// `sbatch --nodes=N` job, the job /create builds for a gang (gang.go), without
-// buffering the members until the last one arrives.
+// `sbatch --nodes=N` job, the gang job of gang.go, without buffering the members
+// until the last one arrives, as /create does.
 
 import (
 	"context"
@@ -42,7 +42,8 @@ type PodGroupCreateRequest struct {
 
 // CreatePodGroupHandler submits the pods of a group as one job. It answers one
 // CreateStruct per pod, in the order of the request, all with the group's job
-// ID, and fails with the status codes of /create.
+// ID. It fails with 400 for a group it or Slurm refuses, 503 when trying again
+// later can work, and otherwise with the status codes of /create.
 func (h *SidecarHandler) CreatePodGroupHandler(w http.ResponseWriter, r *http.Request) {
 	start := time.Now().UnixMicro()
 	tracer := otel.Tracer("interlink-API")
@@ -118,27 +119,44 @@ func (h *SidecarHandler) createPodGroup(ctx context.Context, req PodGroupCreateR
 
 	h.GangMu.Lock()
 	defer h.GangMu.Unlock()
+	if h.GangTable == nil {
+		h.GangTable = make(map[string]*GangEntry)
+	}
 	h.sweepGangsLocked(ctx)
 
 	if jid := h.sharedJobLocked(pods); jid != "" {
 		log.G(ctx).Infof("Group '%s': already submitted as SLURM job %s", name, jid)
 		return groupCreated(pods, jid), nil
 	}
-	if entry, ok := h.GangTable[name]; ok {
-		if !entry.Submitted {
+	// /create keys the same group by its pods' namespace too (gangKey).
+	keys := []string{name}
+	for _, data := range pods {
+		keys = append(keys, gangKey(data.Pod.Namespace, name))
+	}
+	for _, key := range keys {
+		entry, ok := h.GangTable[key]
+		if !ok {
+			continue
+		}
+		if entry.Buffering {
 			return refuse(http.StatusServiceUnavailable, "group %s is being created pod by pod (%d/%d)", name, len(entry.Members), entry.Size)
+		}
+		if !entry.Submitted {
+			// sbatch ran, but its job ID was not recorded: the job may run. The
+			// entry goes with the /delete of its pods, the last of which cancels
+			// the job if sbatch printed its ID.
+			return refuse(http.StatusServiceUnavailable, "group %s: sbatch ran but its job was not recorded (%d of %d pods not deleted yet)", name, len(entry.Members), entry.Size)
 		}
 		if !gangJobIsGone(ctx, h.Config, entry.JID) {
 			return refuse(http.StatusServiceUnavailable, "group %s still runs as job %s", name, entry.JID)
 		}
-		delete(h.GangTable, name)
+		delete(h.GangTable, key)
 	}
 
 	entry := &GangEntry{
-		Name:      name,
-		Size:      len(pods),
-		Members:   make(map[string]*BufferedMember, len(pods)),
-		CreatedAt: time.Now(),
+		Name:    name,
+		Size:    len(pods),
+		Members: make(map[string]*BufferedMember, len(pods)),
 	}
 	ordered := make([]*BufferedMember, 0, len(pods))
 	var rendered []*renderedPod
@@ -157,7 +175,7 @@ func (h *SidecarHandler) createPodGroup(ctx context.Context, req PodGroupCreateR
 			return nil, cerr
 		}
 		rendered = append(rendered, p)
-		m := gangMemberFromCreate(data.Pod, p.filesPath, p.runtimeCommands, p.resourceLimits, p.isDefaultCPU, p.isDefaultRAM, p.flavor)
+		m := gangMemberFromCreate(data.Pod, p.filesPath, p.workDir, p.runtimeCommands, p.resourceLimits, p.isDefaultCPU, p.isDefaultRAM, p.flavor)
 		m.Rank, m.Role = i, GangRoleWorker
 		if i == 0 {
 			m.Role = GangRoleHead
@@ -170,8 +188,8 @@ func (h *SidecarHandler) createPodGroup(ctx context.Context, req PodGroupCreateR
 	if err != nil {
 		span.AddEvent("Failed to submit the group SLURM Job")
 		if errors.Is(err, errGangSubmitted) {
-			// The job may run: the entry stays, so that the /delete of each pod
-			// cancels it, or the sweeper drops it.
+			// The job may run: the entry stays until the /delete of its pods, the
+			// last of which cancels the job if sbatch printed its ID.
 			h.GangTable[name] = entry
 		} else {
 			removeRendered()

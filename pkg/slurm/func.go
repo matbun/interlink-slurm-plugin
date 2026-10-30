@@ -225,7 +225,7 @@ func NewSlurmConfig() (SlurmConfig, error) {
 			if d <= 0 {
 				return SlurmConfig{}, fmt.Errorf("invalid GangTimeout %q: must be a positive duration", SlurmConfigInst.GangTimeout)
 			}
-			log.G(context.Background()).Infof("Gang scheduling ENABLED (interlink.eu/gang-* annotations; buffer timeout %s)", SlurmConfigInst.GangTimeout)
+			log.G(context.Background()).Infof("Gang scheduling ENABLED (pod groups through /createPodGroup, and through /create with a buffer timeout of %s)", SlurmConfigInst.GangTimeout)
 		}
 
 		SlurmConfigInst.set = true

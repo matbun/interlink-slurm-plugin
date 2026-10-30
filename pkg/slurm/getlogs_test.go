@@ -321,8 +321,8 @@ func TestFollowEveryGangRank(t *testing.T) {
 			h, dataRoot, _ := newHandlerWithStubs(t, "88")
 			h.Config.Squeuepath = writeStubScript(t, t.TempDir(), "squeue", "echo '"+tt.state+"'")
 			pods := []v1.Pod{
-				newGangPod("uid-r0", "g", GangRoleHead, 2, nil),
-				newGangPod("uid-r1", "g", GangRoleWorker, 2, nil),
+				newGangMemberPod("uid-r0", "g", GangRoleHead, 2, nil),
+				newGangMemberPod("uid-r1", "g", GangRoleWorker, 2, nil),
 			}
 			for i := range pods {
 				pods[i].Spec.Containers = []v1.Container{{Name: testContainer}}

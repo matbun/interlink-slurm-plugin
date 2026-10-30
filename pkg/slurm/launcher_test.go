@@ -117,19 +117,10 @@ func lookBash() (string, bool) {
 func renderGang(t *testing.T, config SlurmConfig, extra map[string]string, cmd, args []string) (string, string) {
 	t.Helper()
 	dataRoot := t.TempDir() + string(os.PathSeparator)
-	entry := &GangEntry{Name: "g1", Size: 2, Members: map[string]*BufferedMember{
-		"h": mkGangMemberWithRC(t, dataRoot, "h", GangRoleHead, 2, extra, cmd, args),
-		"w": mkGangMemberWithRC(t, dataRoot, "w", GangRoleWorker, 2, extra, cmd, args),
-	}}
-	path, err := produceGangSLURMScript(context.Background(), config, entry, assignRanks(entry.Members))
-	if err != nil {
-		t.Fatalf("produceGangSLURMScript: %v", err)
-	}
-	b, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return string(b), dataRoot
+	entry, ordered := gangOf("g1",
+		mkGangMemberWithRC(t, dataRoot, "h", extra, cmd, args),
+		mkGangMemberWithRC(t, dataRoot, "w", extra, cmd, args))
+	return gangScript(t, config, entry, ordered), dataRoot
 }
 
 func TestProduceGangSLURMScriptSiteLauncher(t *testing.T) {
@@ -180,11 +171,10 @@ func TestSiteLauncherFailsWithoutFallback(t *testing.T) {
 		"no site file":         {BashPath: testBashPath, SiteScriptPath: filepath.Join(t.TempDir(), "none.sh")},
 		"launcher not defined": {BashPath: testBashPath, SiteScriptPath: writeSite(t, testSite)},
 	} {
-		entry := &GangEntry{Name: "g1", Size: 2, Members: map[string]*BufferedMember{
-			"h": mkGangMemberWithRC(t, dataRoot, "h", GangRoleHead, 2, extra, []string{testRay}, nil),
-			"w": mkGangMemberWithRC(t, dataRoot, "w", GangRoleWorker, 2, extra, []string{testRay}, nil),
-		}}
-		if _, err := produceGangSLURMScript(context.Background(), config, entry, assignRanks(entry.Members)); err == nil {
+		entry, ordered := gangOf("g1",
+			mkGangMemberWithRC(t, dataRoot, "h", extra, []string{testRay}, nil),
+			mkGangMemberWithRC(t, dataRoot, "w", extra, []string{testRay}, nil))
+		if _, err := produceGangSLURMScript(context.Background(), config, entry, ordered); err == nil {
 			t.Errorf("%s: the submission must fail, not fall back", name)
 		}
 	}
