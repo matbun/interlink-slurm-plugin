@@ -610,7 +610,7 @@ echo '{"status":"ok","resources":{"cpu":"8"},"capabilities":["something-else"]}'
 			}
 			want := `{"status":"ok","resources":{"cpu":"8"}}`
 			if gangs {
-				want = `{"status":"ok","resources":{"cpu":"8"},"capabilities":["pod-group"]}`
+				want = `{"status":"ok","resources":{"cpu":"8"},"capabilities":["pod-group","podset-create"]}`
 			}
 			if got := rec.Body.String(); got != want {
 				t.Fatalf("ping = %s, want %s", got, want)

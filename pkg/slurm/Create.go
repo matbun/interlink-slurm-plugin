@@ -140,12 +140,108 @@ func submitFailure(err error) *createError {
 	return &createError{code: http.StatusBadRequest, err: se}
 }
 
+// renderedPod is a pod whose directories, files and own job script are written:
+// what submitting it alone, or as one rank of a gang, takes.
+type renderedPod struct {
+	scriptPath      string
+	filesPath       string
+	workDir         string
+	runtimeCommands []ContainerCommand
+	resourceLimits  ResourceLimits
+	isDefaultCPU    bool
+	isDefaultRAM    bool
+	flavor          *FlavorResolution
+}
+
 // createPod renders the pod's job script and submits it, or buffers the pod when
 // it is a gang member. A buffered member gets an empty PodJID.
 func (h *SidecarHandler) createPod(spanCtx context.Context, data commonIL.RetrievedPodData) (CreateStruct, *createError) {
 	span := trace.SpanFromContext(spanCtx)
 	fail := func(code int, err error) (CreateStruct, *createError) {
 		return CreateStruct{}, &createError{code: code, err: err}
+	}
+
+	rendered, cerr := h.renderPod(spanCtx, data)
+	if cerr != nil {
+		return CreateStruct{}, cerr
+	}
+	metadata := data.Pod.ObjectMeta
+	filesPath, workDir, path := rendered.filesPath, rendered.workDir, rendered.scriptPath
+
+	// Gang-scheduling branch: when the feature is enabled AND the pod carries the
+	// interlink.eu/gang-name annotation, do NOT submit one sbatch here. Everything
+	// above (mounts/envs/runtime_command_pod + this member's own job.sh via
+	// produceSLURMScript) has already run, so the member is fully rendered. We
+	// buffer it; only the arrival that completes the gang submits ONE
+	// `sbatch --nodes=N` for the whole group and back-fills every member's JID.
+	// A pod WITHOUT the annotation (or with the feature off) skips this block
+	// entirely and takes the unchanged single-pod path below.
+	if isGangPod(h.Config, metadata) {
+		size, err := gangSizeFromMeta(metadata)
+		if err != nil {
+			os.RemoveAll(filesPath)
+			return fail(http.StatusInternalServerError, err)
+		}
+		member := gangMemberFromCreate(data.Pod, filesPath, rendered.runtimeCommands, rendered.resourceLimits, rendered.isDefaultCPU, rendered.isDefaultRAM, rendered.flavor)
+		gangJID, submitted, err := h.bufferGangMember(spanCtx, member, size)
+		if err != nil {
+			span.AddEvent("Failed to submit the gang SLURM Job")
+			os.RemoveAll(filesPath)
+			return CreateStruct{}, submitFailure(err)
+		}
+
+		// Respond 200 either way (contract-legal):
+		//   - not yet submitted -> empty PodJID; the VK stamps it unvalidated and
+		//     the pod stays Pending until Status sees this UID's JID appear.
+		//   - submitted -> the shared gang JID for THIS pod; siblings reconcile via
+		//     their own Status re-polls (no VK re-Create needed).
+		if submitted {
+			span.AddEvent("Gang SLURM Job successfully submitted with ID " + gangJID)
+			return CreateStruct{PodUID: string(data.Pod.UID), PodJID: gangJID}, nil
+		}
+		span.AddEvent("Gang member buffered, awaiting quorum")
+		return CreateStruct{PodUID: string(data.Pod.UID), PodJID: ""}, nil
+	}
+
+	out, err := SLURMBatchSubmit(h.Ctx, h.Config, path)
+	if err != nil {
+		span.AddEvent("Failed to submit the SLURM Job")
+		os.RemoveAll(filesPath)
+		if workDir != filesPath {
+			os.RemoveAll(workDir)
+		}
+		return CreateStruct{}, submitFailure(err)
+	}
+	log.G(h.Ctx).Info(out)
+	jid, err := handleJidAndPodUid(h.Ctx, data.Pod, h.JIDs, out, filesPath, workDir)
+	if err != nil {
+		os.RemoveAll(filesPath)
+		if workDir != filesPath {
+			os.RemoveAll(workDir)
+		}
+		podUID := string(data.Pod.UID)
+		if h.JIDs != nil {
+			if _, ok := (*h.JIDs)[podUID]; ok {
+				if derr := deleteContainer(spanCtx, h.Config, podUID, h.JIDs, workDir); derr != nil {
+					log.G(h.Ctx).Error(derr)
+				}
+			} else {
+				log.G(h.Ctx).Info("Skipping deleteContainer cleanup because no JID was registered for pod UID " + podUID)
+			}
+		}
+		return fail(http.StatusGatewayTimeout, err)
+	}
+
+	span.AddEvent("SLURM Job successfully submitted with ID " + jid)
+	return CreateStruct{PodUID: string(data.Pod.UID), PodJID: jid}, nil
+}
+
+// renderPod checks the pod's sbatch flags and writes its directories, files and
+// own job script. A failure removes what it wrote, as createPod always did.
+func (h *SidecarHandler) renderPod(spanCtx context.Context, data commonIL.RetrievedPodData) (*renderedPod, *createError) {
+	span := trace.SpanFromContext(spanCtx)
+	fail := func(code int, err error) (*renderedPod, *createError) {
+		return nil, &createError{code: code, err: err}
 	}
 
 	if err := checkQueueFlags(data.Pod.Annotations); err != nil {
@@ -338,7 +434,7 @@ func (h *SidecarHandler) createPod(spanCtx context.Context, data commonIL.Retrie
 			if workDir != filesPath {
 				os.RemoveAll(workDir)
 			}
-			return CreateStruct{}, &createError{err: err, noReply: true}
+			return nil, &createError{err: err, noReply: true}
 		}
 	} else {
 
@@ -388,74 +484,18 @@ func (h *SidecarHandler) createPod(spanCtx context.Context, data commonIL.Retrie
 			if workDir != filesPath {
 				os.RemoveAll(workDir)
 			}
-			return CreateStruct{}, &createError{err: err, noReply: true}
+			return nil, &createError{err: err, noReply: true}
 		}
 	}
 
-	// Gang-scheduling branch: when the feature is enabled AND the pod carries the
-	// interlink.eu/gang-name annotation, do NOT submit one sbatch here. Everything
-	// above (mounts/envs/runtime_command_pod + this member's own job.sh via
-	// produceSLURMScript) has already run, so the member is fully rendered. We
-	// buffer it; only the arrival that completes the gang submits ONE
-	// `sbatch --nodes=N` for the whole group and back-fills every member's JID.
-	// A pod WITHOUT the annotation (or with the feature off) skips this block
-	// entirely and takes the unchanged single-pod path below.
-	if isGangPod(h.Config, metadata) {
-		size, err := gangSizeFromMeta(metadata)
-		if err != nil {
-			os.RemoveAll(filesPath)
-			return fail(http.StatusInternalServerError, err)
-		}
-		member := gangMemberFromCreate(data.Pod, filesPath, runtime_command_pod, resourceLimits, isDefaultCPU, isDefaultRam, flavor)
-		gangJID, submitted, err := h.bufferGangMember(spanCtx, member, size)
-		if err != nil {
-			span.AddEvent("Failed to submit the gang SLURM Job")
-			os.RemoveAll(filesPath)
-			return CreateStruct{}, submitFailure(err)
-		}
-
-		// Respond 200 either way (contract-legal):
-		//   - not yet submitted -> empty PodJID; the VK stamps it unvalidated and
-		//     the pod stays Pending until Status sees this UID's JID appear.
-		//   - submitted -> the shared gang JID for THIS pod; siblings reconcile via
-		//     their own Status re-polls (no VK re-Create needed).
-		if submitted {
-			span.AddEvent("Gang SLURM Job successfully submitted with ID " + gangJID)
-			return CreateStruct{PodUID: string(data.Pod.UID), PodJID: gangJID}, nil
-		}
-		span.AddEvent("Gang member buffered, awaiting quorum")
-		return CreateStruct{PodUID: string(data.Pod.UID), PodJID: ""}, nil
-	}
-
-	out, err := SLURMBatchSubmit(h.Ctx, h.Config, path)
-	if err != nil {
-		span.AddEvent("Failed to submit the SLURM Job")
-		os.RemoveAll(filesPath)
-		if workDir != filesPath {
-			os.RemoveAll(workDir)
-		}
-		return CreateStruct{}, submitFailure(err)
-	}
-	log.G(h.Ctx).Info(out)
-	jid, err := handleJidAndPodUid(h.Ctx, data.Pod, h.JIDs, out, filesPath, workDir)
-	if err != nil {
-		os.RemoveAll(filesPath)
-		if workDir != filesPath {
-			os.RemoveAll(workDir)
-		}
-		podUID := string(data.Pod.UID)
-		if h.JIDs != nil {
-			if _, ok := (*h.JIDs)[podUID]; ok {
-				if derr := deleteContainer(spanCtx, h.Config, podUID, h.JIDs, workDir); derr != nil {
-					log.G(h.Ctx).Error(derr)
-				}
-			} else {
-				log.G(h.Ctx).Info("Skipping deleteContainer cleanup because no JID was registered for pod UID " + podUID)
-			}
-		}
-		return fail(http.StatusGatewayTimeout, err)
-	}
-
-	span.AddEvent("SLURM Job successfully submitted with ID " + jid)
-	return CreateStruct{PodUID: string(data.Pod.UID), PodJID: jid}, nil
+	return &renderedPod{
+		scriptPath:      path,
+		filesPath:       filesPath,
+		workDir:         workDir,
+		runtimeCommands: runtime_command_pod,
+		resourceLimits:  resourceLimits,
+		isDefaultCPU:    isDefaultCPU,
+		isDefaultRAM:    isDefaultRam,
+		flavor:          flavor,
+	}, nil
 }

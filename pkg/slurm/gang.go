@@ -16,6 +16,7 @@ package slurm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -870,40 +871,54 @@ func (h *SidecarHandler) bufferGangMember(ctx context.Context, member *BufferedM
 	log.G(ctx).Infof("Gang '%s': quorum reached (%d/%d), submitting single co-scheduled sbatch", gangName, len(entry.Members), entry.Size)
 
 	ordered := assignRanks(entry.Members)
-	scriptPath, err := produceGangSLURMScript(ctx, h.Config, entry, ordered)
+	jid, err := h.submitGang(ctx, entry, ordered)
 	if err != nil {
 		// This member's create fails and its controller replaces it; the others stay
 		// buffered, so the replacement completes the quorum again instead of making
-		// the gang larger than its size.
-		delete(entry.Members, member.PodUID)
+		// the gang larger than its size. After sbatch ran it stays: the job may run.
+		if !errors.Is(err, errGangSubmitted) {
+			delete(entry.Members, member.PodUID)
+		}
 		return "", false, err
+	}
+	return jid, true, nil
+}
+
+// errGangSubmitted marks a failure after the gang's sbatch ran: its job may run.
+var errGangSubmitted = errors.New("sbatch ran")
+
+// submitGang submits ONE sbatch for the members of entry, ordered by rank, and
+// back-fills every member's JID. The caller MUST hold h.GangMu.
+func (h *SidecarHandler) submitGang(ctx context.Context, entry *GangEntry, ordered []*BufferedMember) (string, error) {
+	scriptPath, err := produceGangSLURMScript(ctx, h.Config, entry, ordered)
+	if err != nil {
+		return "", err
 	}
 
 	out, err := SLURMBatchSubmit(h.Ctx, h.Config, scriptPath)
 	if err != nil {
-		delete(entry.Members, member.PodUID)
-		log.G(ctx).Error("Gang '"+gangName+"': sbatch failed: ", err)
-		return "", false, err
+		log.G(ctx).Error("Gang '"+entry.Name+"': sbatch failed: ", err)
+		return "", err
 	}
 	log.G(ctx).Info(out)
 
 	jid, err := parseJIDFromSubmit(out)
 	if err != nil {
-		return "", false, fmt.Errorf("gang %s: %w", gangName, err)
+		return "", fmt.Errorf("gang %s: %w: %w", entry.Name, errGangSubmitted, err)
 	}
 
 	// Back-fill every member: register the shared JID in JIDs and persist the
 	// per-pod bookkeeping files so LoadJIDs rehydrates all N on restart.
 	for _, m := range ordered {
 		if err := stampJID(ctx, h.JIDs, m.PodUID, m.Namespace, jid, m.FilesPath); err != nil {
-			return "", false, err
+			return "", fmt.Errorf("%w: %w", errGangSubmitted, err)
 		}
 	}
 	entry.JID = jid
 	entry.Submitted = true
-	log.G(ctx).Infof("Gang '%s': submitted as SLURM job %s (%d nodes)", gangName, jid, len(ordered))
+	log.G(ctx).Infof("Gang '%s': submitted as SLURM job %s (%d nodes)", entry.Name, jid, len(ordered))
 
-	return jid, true, nil
+	return jid, nil
 }
 
 // removeGangMemberOnDelete drops a deleted pod's UID from its gang entry and

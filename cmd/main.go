@@ -205,6 +205,7 @@ func main() {
 	mutex := http.NewServeMux()
 	mutex.HandleFunc("/status", SidecarAPIs.StatusHandler)
 	mutex.HandleFunc("/create", SidecarAPIs.SubmitHandler)
+	mutex.HandleFunc("/createPodSets", SidecarAPIs.CreatePodSetsHandler)
 	mutex.HandleFunc("/delete", SidecarAPIs.StopHandler)
 	mutex.HandleFunc("/getLogs", SidecarAPIs.GetLogsHandler)
 	mutex.HandleFunc("/system-info", SidecarAPIs.SystemInfoHandler)
