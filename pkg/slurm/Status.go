@@ -41,10 +41,22 @@ const (
 	ReasonOOMKilled  = "OOMKilled"
 	MessageOOMKilled = "SLURM job was killed due to out-of-memory condition"
 
+	// ReasonSlurmJobCancelled is set on every container of a job cancelled outside
+	// the plugin (state "CA"), whatever its exit code.
+	ReasonSlurmJobCancelled  = "Cancelled"
+	MessageSlurmJobCancelled = "SLURM job was cancelled"
+
+	// ReasonSlurmJobPending and ReasonSlurmJobConfiguring are the waiting reasons of
+	// a pending (PD) or configuring (CF) job when squeue gives no reason of its own
+	// (Priority, Resources, QOSMaxJobsPerUserLimit, ...).
+	ReasonSlurmJobPending     = "Pending"
+	ReasonSlurmJobConfiguring = "Configuring"
+
 	// SlurmStatePattern is the regex alternation used to extract the SLURM job state
 	// from a squeue output line.  Longer alternatives (e.g. ST, OOM) are listed before
-	// shorter prefixes (S) so the regex engine picks the correct token.
-	SlurmStatePattern = `(CD|CG|F|OOM|PD|PR|R|ST|S|TO)`
+	// shorter prefixes (S) so the regex engine picks the correct token, and CF before
+	// F so a job whose nodes are still booting is not read as failed.
+	SlurmStatePattern = `(CA|CD|CF|CG|F|OOM|PD|PR|R|ST|S|TO)`
 
 	// SlurmExitCodePattern is the regex used to extract the numeric exit/signal code
 	// from a squeue output line (format "<exit>:<signal>  <state>").
@@ -69,6 +81,44 @@ func terminatedContainerStatus(ctName string, startTime, finishTime time.Time, e
 		},
 		Ready: false,
 	}
+}
+
+// waitingContainerStatus builds the status of a container whose job has not
+// started: squeue's reason, or the state's name when there is none, and a message
+// naming the job.
+func waitingContainerStatus(ctName, jid, state, reason string) v1.ContainerStatus {
+	waitReason, msg := ReasonSlurmJobPending, "SLURM job "+jid+" is pending"
+	if state == "CF" {
+		waitReason, msg = ReasonSlurmJobConfiguring, "SLURM job "+jid+" is configuring its nodes"
+	}
+	if reason != "" {
+		waitReason = reason
+		msg += " (" + reason + ")"
+	}
+	return v1.ContainerStatus{
+		Name:  ctName,
+		State: v1.ContainerState{Waiting: &v1.ContainerStateWaiting{Reason: waitReason, Message: msg}},
+		Ready: false,
+	}
+}
+
+var slurmStateRe = regexp.MustCompile(SlurmStatePattern)
+
+// squeueStateAndReason reads the compact state and the reason from the line
+// squeueStatusArgs asks for: exit code, state, reason. A reason of None is empty.
+func squeueStateAndReason(stdout string) (state, reason string) {
+	for _, line := range strings.Split(stdout, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		reason = strings.Join(fields[2:], " ")
+		if reason == "None" {
+			reason = ""
+		}
+		return slurmStateRe.FindString(fields[1]), reason
+	}
+	return slurmStateRe.FindString(stdout), ""
 }
 
 // StatusHandler performs a squeue --me and uses regular expressions to get the running Jobs' status
@@ -267,9 +317,7 @@ func (h *SidecarHandler) podStatuses(spanCtx context.Context, req []*v1.Pod, ses
 
 					resp = append(resp, commonIL.PodStatus{PodName: pod.Name, PodUID: string(pod.UID), PodNamespace: pod.Namespace, Containers: containerStatuses})
 				} else {
-					statePattern := SlurmStatePattern
-					stateRe := regexp.MustCompile(statePattern)
-					stateMatch := stateRe.FindString(execReturn.Stdout)
+					stateMatch, reason := squeueStateAndReason(execReturn.Stdout)
 
 					// If the job is not in terminal state, the exit code has no meaning, however squeue returns 0 for exit code in this case. Just ignore the value.
 					// Magic REGEX that matches any number from 0 to 255 included. Eg: match 2, 255, does not match 256, 02, -1.
@@ -367,10 +415,26 @@ func (h *SidecarHandler) podStatuses(spanCtx context.Context, req []*v1.Pod, ses
 							containerStatuses = append(containerStatuses, containerStatus)
 						}
 						resp = append(resp, commonIL.PodStatus{PodName: pod.Name, PodUID: string(pod.UID), PodNamespace: pod.Namespace, Containers: containerStatuses})
-					case "PD":
+					case "PD", "CF":
 						for _, ct := range pod.Spec.Containers {
-							containerStatus := v1.ContainerStatus{Name: ct.Name, State: v1.ContainerState{Waiting: &v1.ContainerStateWaiting{}}, Ready: false}
-							containerStatuses = append(containerStatuses, containerStatus)
+							containerStatuses = append(containerStatuses, waitingContainerStatus(ct.Name, (*h.JIDs)[uid].JID, stateMatch, reason))
+						}
+						resp = append(resp, commonIL.PodStatus{PodName: pod.Name, PodUID: string(pod.UID), PodNamespace: pod.Namespace, Containers: containerStatuses})
+					case "CA":
+						// Cancelled outside the plugin, by scancel or an administrator.
+						if (*h.JIDs)[uid].EndTime.IsZero() {
+							(*h.JIDs)[uid].EndTime = timeNow
+							if err := os.WriteFile(path+"/FinishedAt.time", []byte((*h.JIDs)[uid].EndTime.Format("2006-01-02 15:04:05.999999999 -0700 MST")), 0o644); err != nil {
+								return fail(http.StatusInternalServerError, err)
+							}
+						}
+						for _, ct := range pod.Spec.Containers {
+							exitCode, err := getExitCode(h.Ctx, path, ct.Name, exitCodeMatch, stateMatch, sessionContextMessage)
+							if err != nil {
+								log.G(h.Ctx).Error(err)
+								continue
+							}
+							containerStatuses = append(containerStatuses, terminatedContainerStatus(ct.Name, (*h.JIDs)[uid].StartTime, (*h.JIDs)[uid].EndTime, exitCode, ReasonSlurmJobCancelled, MessageSlurmJobCancelled))
 						}
 						resp = append(resp, commonIL.PodStatus{PodName: pod.Name, PodUID: string(pod.UID), PodNamespace: pod.Namespace, Containers: containerStatuses})
 					case "PR":
@@ -579,9 +643,9 @@ func (h *SidecarHandler) podStatuses(spanCtx context.Context, req []*v1.Pod, ses
 //
 // exit_code is preferred over DerivedEC: a cancelled job reports 15 there and 0 in
 // DerivedEC.  --states=all is needed or terminal jobs are hidden and the exit code
-// cannot be read back.
+// cannot be read back.  Reason, last, is why a pending job waits.
 func squeueStatusArgs(jid string) []string {
-	return []string{"--noheader", "-a", "--states=all", "-O", "exit_code,StateCompact", "-j", jid}
+	return []string{"--noheader", "-a", "--states=all", "-O", "exit_code,StateCompact,Reason:128", "-j", jid}
 }
 
 // getSinfoSummary executes 'sinfo -s' command and returns the output
@@ -661,8 +725,23 @@ func (h *SidecarHandler) getClusterResources() (PingResponse, error) {
 		copy(taints, h.Config.Taints)
 		resp.Taints = &taints
 	}
+	// What the plugin offers follows its configuration, not the script.
+	resp.Capabilities = pluginCapabilities(h.Config)
 
 	return resp, nil
+}
+
+// CapabilityPodGroup is listed in the ping answer when the pods of one Kueue pod
+// group (label kueue.x-k8s.io/pod-group-name, annotation
+// kueue.x-k8s.io/pod-group-total-count), created one by one, run as one job.
+const CapabilityPodGroup = "pod-group"
+
+// pluginCapabilities lists what the ping answer advertises.
+func pluginCapabilities(config SlurmConfig) []string {
+	if config.GangSchedulingEnabled {
+		return []string{CapabilityPodGroup}
+	}
+	return nil
 }
 
 // getClusterResourcesFromScript executes the custom script at

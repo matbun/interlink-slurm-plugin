@@ -107,12 +107,19 @@ func resetStatusCache() {
 	lastAccountCheck = time.Time{}
 }
 
-// forgetStatuses drops the cached status of these pods, so the next read asks
-// squeue.
-func forgetStatuses(uids []string) {
+// reportedTerminated reports whether the last status read of the pod has the
+// container terminated.
+func reportedTerminated(podUID, container string) bool {
 	statusCacheMu.Lock()
 	defer statusCacheMu.Unlock()
-	for _, uid := range uids {
-		delete(statusCache, uid)
+	entry, ok := statusCache[podUID]
+	if !ok {
+		return false
 	}
+	for _, c := range entry.status.Containers {
+		if c.Name == container {
+			return c.State.Terminated != nil
+		}
+	}
+	return false
 }

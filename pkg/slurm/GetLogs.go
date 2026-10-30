@@ -1,7 +1,7 @@
 package slurm
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -23,6 +23,37 @@ import (
 	trace "go.opentelemetry.io/otel/trace"
 )
 
+// followPollInterval is how long a followed log waits before reading again.
+var followPollInterval = 4 * time.Second
+
+// followNoticeAfter is how long a followed log waits for its file before it tells
+// the caller so: the virtual kubelet's request times out after 30 s without a
+// byte, while any caller shows the notice as a log line.
+var followNoticeAfter = 20 * time.Second
+
+// followReadRetries is how many reads in a row may fail before a followed log
+// gives up. A network filesystem (sshfs, rclone) can fail a read of a file the
+// job is writing on another host; the next read usually works.
+const followReadRetries = 5
+
+// hasJob reports whether the pod has a job, under GangMu so that a delete's
+// removal of the job is seen consistently.
+func (h *SidecarHandler) hasJob(ctx context.Context, podUID string) bool {
+	h.GangMu.Lock()
+	defer h.GangMu.Unlock()
+	return checkIfJidExists(ctx, h.JIDs, podUID)
+}
+
+// containerEnded reports whether a followed container has nothing more to write:
+// it wrote its status file, or the last status read reported it terminated, as for
+// a job cancelled, timed out or killed before the container could write the file.
+func containerEnded(podUID, container, statusPath string) bool {
+	if _, err := os.Stat(statusPath); err == nil {
+		return true
+	}
+	return reportedTerminated(podUID, container)
+}
+
 // Logs in follow mode (get logs until the death of the container) with "kubectl -f".
 func (h *SidecarHandler) GetLogsFollowMode(
 	spanCtx context.Context,
@@ -33,6 +64,7 @@ func (h *SidecarHandler) GetLogsFollowMode(
 	req commonIL.LogStruct,
 	containerOutputPath string,
 	containerOutput []byte,
+	jobOutputLen int,
 	sessionContext string,
 ) error {
 	// Follow until this file exist, that indicates the end of container, thus the end of following.
@@ -42,110 +74,167 @@ func (h *SidecarHandler) GetLogsFollowMode(
 	sessionContextMessage := GetSessionContextMessage(sessionContext)
 	log.G(h.Ctx).Debug(sessionContextMessage, "Check container status", containerStatusPath, " with current length/offset: ", containerOutputLastOffset)
 
-	var containerOutputFd *os.File
-	var err error
+	hadJob := false
+	waitStart, noticed := time.Now(), false
 	for {
-		containerOutputFd, err = os.Open(containerOutputPath)
-		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				// Case the file does not exist yet, we loop until it exist.
-				notFoundMsg := sessionContextMessage + "Cannot open in follow mode the container logs " + containerOutputPath + " because it does not exist yet, sleeping before retrying..."
-				log.G(h.Ctx).Debug(notFoundMsg)
-				// Warning: if we don't write anything to body before 30s, there will be a timeout in VK to API DoReq(), thus we send an informational message that the log is not ready.
-				w.Write([]byte(notFoundMsg))
-				// Flush otherwise it will be as if nothing was written.
-				if f, ok := w.(http.Flusher); ok {
-					log.G(h.Ctx).Debug(sessionContextMessage, "wrote file not found yet, now flushing this message...")
-					f.Flush()
-				} else {
-					log.G(h.Ctx).Error(sessionContextMessage, "wrote file not found but could not flush because server does not support Flusher.")
-				}
-				time.Sleep(4 * time.Second)
-				continue
-			} else {
-				// Case unknown error.
-				errWithContext := fmt.Errorf(sessionContextMessage+"could not open file to follow logs at %s error type: %s error: %w", containerOutputPath, fmt.Sprintf("%#v", err), err)
-				log.G(h.Ctx).Error(errWithContext)
-				w.Write([]byte(errWithContext.Error()))
-				return err
-			}
+		_, err := os.Stat(containerOutputPath)
+		if err == nil {
+			log.G(h.Ctx).Debug(sessionContextMessage, "found for follow mode the container logs ", containerOutputPath)
+			break
 		}
-		// File exist.
-		log.G(h.Ctx).Debug(sessionContextMessage, "opened for follow mode the container logs ", containerOutputPath)
-		break
-	}
-	defer containerOutputFd.Close()
-
-	// We follow only from after what is already read.
-	_, err = containerOutputFd.Seek(int64(containerOutputLastOffset), 0)
-	if err != nil {
-		errWithContext := fmt.Errorf(sessionContextMessage+"error during Seek() of GetLogsFollowMode() in GetLogsHandler of file %s offset %d type: %s %w", containerOutputPath, containerOutputLastOffset, fmt.Sprintf("%#v", err), err)
-		w.Write([]byte(errWithContext.Error()))
-		return errWithContext
-	}
-
-	containerOutputReader := bufio.NewReader(containerOutputFd)
-
-	bufferBytes := make([]byte, 4096)
-
-	// Looping until we get end of job.
-	// TODO: handle the Ctrl+C of kubectl logs.
-	var isContainerDead bool = false
-	for {
-		n, errRead := containerOutputReader.Read(bufferBytes)
-		if errRead != nil && errRead != io.EOF {
-			// Error during read.
-			h.logErrorVerbose(sessionContextMessage+"error doing Read() of GetLogsFollowMode", h.Ctx, w, errRead)
-			return errRead
-		}
-		// Write ASAP what we could read of it.
-		_, err = w.Write(bufferBytes[:n])
-		if err != nil {
-			h.logErrorVerbose(sessionContextMessage+"error doing Write() of GetLogsFollowMode", h.Ctx, w, err)
+		if !errors.Is(err, fs.ErrNotExist) {
+			// Case unknown error.
+			errWithContext := fmt.Errorf(sessionContextMessage+"could not open file to follow logs at %s error type: %s error: %w", containerOutputPath, fmt.Sprintf("%#v", err), err)
+			log.G(h.Ctx).Error(errWithContext)
+			w.Write([]byte(errWithContext.Error()))
 			return err
 		}
+		// A container that ended, or a pod deleted, before the log appeared
+		// leaves nothing to follow.
+		hasJob := h.hasJob(spanCtx, podUid)
+		if (hadJob && !hasJob) || containerEnded(podUid, req.ContainerName, containerStatusPath) || r.Context().Err() != nil {
+			log.G(h.Ctx).Info(sessionContextMessage, "Container ended before its log ", containerOutputPath, " appeared, exiting following mode...")
+			return nil
+		}
+		hadJob = hadJob || hasJob
+		// Case the file does not exist yet, we loop until it exist.
+		notFoundMsg := sessionContextMessage + "Cannot open in follow mode the container logs " + containerOutputPath + " because it does not exist yet, sleeping before retrying..."
+		log.G(h.Ctx).Debug(notFoundMsg)
+		// Warning: if we don't write anything to body before 30s, there will be a timeout in VK to API DoReq(), thus we send an
+		// informational message that the log is not ready, once and on its own line, so a short wait leaves the log clean.
+		if !noticed && time.Since(waitStart) >= followNoticeAfter {
+			noticed = true
+			w.Write([]byte(notFoundMsg + "\n"))
+			// Flush otherwise it will be as if nothing was written.
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+		time.Sleep(followPollInterval)
+	}
 
+	// Looping until we get end of job. The file is opened again at every read, at
+	// the offset reached so far: on a network filesystem (sshfs, rclone) an open
+	// handle may never see what the job appends from another host.
+	offset := int64(containerOutputLastOffset)
+	// The job's own output (job.out) is followed too, as whole lines between the
+	// container's lines, so what the launcher writes after the start shows up.
+	jobOutPath, jobOffset := path+"/job.out", int64(jobOutputLen)
+	atLineStart := len(containerOutput) == 0 || containerOutput[len(containerOutput)-1] == '\n'
+	var isContainerDead bool = false
+	failedReads := 0
+	for {
+		data, errRead := readLogFrom(containerOutputPath, offset)
+		n := int64(len(data))
+		if n > 0 {
+			if _, err := w.Write(data); err != nil {
+				return err
+			}
+			offset += n
+			atLineStart = data[n-1] == '\n'
+		}
+		if errRead != nil {
+			// Nothing is written to the stream: it is the job's log. A failed read is
+			// tried again from the offset reached, which counts only copied bytes.
+			failedReads++
+			log.G(h.Ctx).Warning(sessionContextMessage, "reading the log in GetLogsFollowMode (", failedReads, " in a row): ", errRead)
+			if failedReads >= followReadRetries || r.Context().Err() != nil {
+				return errRead
+			}
+			time.Sleep(followPollInterval)
+			continue
+		}
+		failedReads = 0
+		if atLineStart {
+			copyNewLines(w, jobOutPath, &jobOffset, false)
+		}
 		// Flush otherwise it will take time to appear in kubectl logs.
 		if f, ok := w.(http.Flusher); ok {
-			log.G(h.Ctx).Debug(sessionContextMessage, "wrote some logs, now flushing...")
 			f.Flush()
 		} else {
 			log.G(h.Ctx).Error(sessionContextMessage, "wrote some logs but could not flush because server does not support Flusher.")
 		}
-
-		if errRead != nil {
-			if errRead == io.EOF {
-				// Nothing more to read, but in follow mode, is the container still alive?
-				if isContainerDead {
-					// Container already marked as dead, and we tried to get logs one last time. Exiting the loop.
-					log.G(h.Ctx).Info(sessionContextMessage, "Container was found dead and no more logs are found at this step, exiting following mode...")
-					break
-				}
-				// Checking if container is dead (meaning the job ID is not in context anymore, OR if the status file exist).
-				if !checkIfJidExists(spanCtx, (h.JIDs), podUid) {
-					// The JID disappeared, so the container is dead, probably from a POD delete request. Trying to get the latest log one last time.
-					// Because the moment we found this, there might be some more logs to read.
-					isContainerDead = true
-					log.G(h.Ctx).Info(sessionContextMessage, "Container is found dead thanks to missing JID, reading last logs...")
-				} else if _, err := os.Stat(containerStatusPath); errors.Is(err, os.ErrNotExist) {
-					// The status file of the container does not exist, so the container is still alive. Continuing to follow logs.
-					// Sleep because otherwise it can be a stress to file system to always read it when it has nothing.
-					log.G(h.Ctx).Debug(sessionContextMessage, "EOF of container logs, sleeping 4s before retrying...")
-					time.Sleep(4 * time.Second)
-				} else {
-					// The status file exist, so the container is dead. Trying to get the latest log one last time.
-					// Because the moment we found the status file, there might be some more logs to read.
-					isContainerDead = true
-					log.G(h.Ctx).Info(sessionContextMessage, "Container is found dead thanks to status file, reading last logs...")
-				}
-				continue
-			} else {
-				// Unreachable code.
+		if n > 0 {
+			continue
+		}
+		// Nothing more to read, but in follow mode, is the container still alive?
+		if isContainerDead {
+			// Container already marked as dead, and we tried to get logs one last time. Exiting the loop.
+			log.G(h.Ctx).Info(sessionContextMessage, "Container was found dead and no more logs are found at this step, exiting following mode...")
+			if !atLineStart {
+				_, _ = w.Write([]byte("\n"))
 			}
+			copyNewLines(w, jobOutPath, &jobOffset, true)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			break
+		}
+		// Checking if container is dead (meaning the job ID is not in context anymore, OR if the status file exist,
+		// OR if the status reported it terminated).
+		switch {
+		case !h.hasJob(spanCtx, podUid):
+			// The JID disappeared, so the container is dead, probably from a POD delete request. Trying to get the latest log one last time.
+			isContainerDead = true
+			log.G(h.Ctx).Info(sessionContextMessage, "Container is found dead thanks to missing JID, reading last logs...")
+		case containerEnded(podUid, req.ContainerName, containerStatusPath):
+			// The status file exists or the status reported the container terminated. Trying to get the latest log one last time.
+			isContainerDead = true
+			log.G(h.Ctx).Info(sessionContextMessage, "Container is found dead thanks to status file or status, reading last logs...")
+		case r.Context().Err() != nil:
+			// The caller went away.
+			return nil
+		default:
+			// The container is still alive: sleep, so the file system is not read again at once.
+			time.Sleep(followPollInterval)
 		}
 	}
 	// No error, err = nil
 	return nil
+}
+
+// readLogFrom reads the file at path from offset to its current end, opening it
+// again each time: on a network filesystem (sshfs, rclone) an open handle may never
+// see what the job appends from another host. A file that shrank below offset
+// (truncated) is read again from the start; a missing file reads as empty. On a
+// failed read it returns what it read before the error.
+func readLogFrom(path string, offset int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+	if fi, err := f.Stat(); err == nil && fi.Size() < offset {
+		offset = 0
+	}
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		return nil, err
+	}
+	return io.ReadAll(f)
+}
+
+// copyNewLines writes to w the complete lines of the file at path past *offset
+// and moves *offset after them; with all, also a last line without a newline,
+// ended by one. A failed read writes nothing, and the next call tries again.
+func copyNewLines(w io.Writer, path string, offset *int64, all bool) {
+	data, err := readLogFrom(path, *offset)
+	if err != nil {
+		return
+	}
+	if !all {
+		data = data[:bytes.LastIndexByte(data, '\n')+1]
+	}
+	if len(data) == 0 {
+		return
+	}
+	*offset += int64(len(data))
+	if data[len(data)-1] != '\n' {
+		data = append(data, '\n')
+	}
+	_, _ = w.Write(data)
 }
 
 // GetLogsHandler reads Jobs' output file to return what's logged inside.
@@ -321,7 +410,7 @@ func (h *SidecarHandler) getLogs(spanCtx context.Context, start int64, req commo
 	}
 
 	if req.Opts.Follow {
-		err := h.GetLogsFollowMode(spanCtx, req.PodUID, w, r, path, req, containerOutputPath, containerOutput, sessionContext)
+		err := h.GetLogsFollowMode(spanCtx, req.PodUID, w, r, path, req, containerOutputPath, containerOutput, len(jobOutput), sessionContext)
 		if err != nil {
 			h.logErrorVerbose(sessionContextMessage+"follow mode error", spanCtx, w, err)
 		}

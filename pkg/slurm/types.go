@@ -139,15 +139,10 @@ type SlurmConfig struct {
 	// plugin's own time zone.
 	SiteTimeZone string `yaml:"SiteTimeZone"`
 
-	// Executor turns the plugin into a kueue-offload executor: /submit, /jobs
-	// and the workload form of /getLogs. See executor.go.
-	Executor ExecutorConfig `yaml:"Executor"`
-	// Sites are the HPC sites the executor submits to, by name. One in this version.
+	// Sites names the site the ssh shims set as SbatchPath, SqueuePath and
+	// ScancelPath connect to, at most one. Empty: the shims, if any, read their
+	// target from the environment the plugin was started with. See site.go.
 	Sites map[string]SiteConfig `yaml:"Sites"`
-	// Shadow configures the pod that carries a running job's tunnel and logs.
-	Shadow ShadowConfig `yaml:"Shadow"`
-	// Staging copies a workload's inputs to the site and its outputs back.
-	Staging StagingConfig `yaml:"Staging"`
 }
 
 type CreateStruct struct {
@@ -319,6 +314,10 @@ type PingResponse struct {
 	// node.  When present (even as an empty slice), all non-system taints on the node
 	// are replaced with this list.  When absent, existing taints are left unchanged.
 	Taints *[]TaintConfig `json:"taints,omitempty"`
+	// Capabilities lists what the plugin offers beyond one job per pod, such as
+	// "pod-group". interLink's PingResponse has no such field yet; a decoder that
+	// does not know it ignores it.
+	Capabilities []string `json:"capabilities,omitempty"`
 }
 
 // ResourcesResponse carries Kubernetes-quantity strings for each resource dimension.

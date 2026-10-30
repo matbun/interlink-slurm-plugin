@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -44,7 +46,7 @@ func (h *SidecarHandler) SubmitHandler(w http.ResponseWriter, r *http.Request) {
 	var data commonIL.RetrievedPodData
 	err = json.Unmarshal(bodyBytes, &data)
 	if err != nil {
-		h.handleError(spanCtx, w, http.StatusGatewayTimeout, err)
+		h.handleError(spanCtx, w, http.StatusBadRequest, err)
 		return
 	}
 
@@ -72,10 +74,70 @@ func (h *SidecarHandler) SubmitHandler(w http.ResponseWriter, r *http.Request) {
 
 // createError is a failed create: the HTTP status and error SubmitHandler answers
 // with. noReply is set where SubmitHandler has always returned without writing.
+// 503 means trying again later can work and 4xx that it cannot; the virtual
+// kubelet treats every code the same.
 type createError struct {
 	code    int
 	err     error
 	noReply bool
+}
+
+// slurmFlagsAnnotation carries extra sbatch flags.
+const slurmFlagsAnnotation = "slurm-job.vk.io/flags"
+
+// preExecAnnotation is shell the job script runs before the workload.
+const preExecAnnotation = "slurm-job.vk.io/pre-exec"
+
+// slurmNamePattern is what an account, a partition or a QOS may contain: they end
+// up in the job script's #SBATCH lines.
+var slurmNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.,-]*$`)
+
+// queueFlagNames names the flags checked against slurmNamePattern, by the key
+// slurmFlagKey gives them.
+var queueFlagNames = map[string]string{
+	"--account":   "account",
+	"--partition": "partition",
+	"--qos":       "QOS",
+	"-q":          "QOS",
+}
+
+// checkQueueFlags refuses an account, partition or QOS in the pod's sbatch flags
+// that slurmNamePattern does not allow.
+func checkQueueFlags(annotations map[string]string) error {
+	for _, flag := range splitSlurmFlags(annotations[slurmFlagsAnnotation]) {
+		name, ok := queueFlagNames[slurmFlagKey(flag)]
+		if !ok {
+			continue
+		}
+		if value := slurmFlagValue(flag); !slurmNamePattern.MatchString(value) {
+			return fmt.Errorf("%s: invalid %s %q", slurmFlagsAnnotation, name, value)
+		}
+	}
+	return nil
+}
+
+// sbatchLaterRe matches sbatch refusals that end once other jobs end or the
+// controller answers again: limits on the number of submitted jobs, and an
+// unreachable or busy controller. A refused account or an invalid script stays
+// permanent.
+var sbatchLaterRe = regexp.MustCompile(`(QOS|Assoc)MaxSubmitJob[A-Za-z]*|MaxSubmitJobs?Limit|Unable to contact slurm controller|Socket timed out|Slurm temporarily unable to accept job`)
+
+// submitFailure is the answer to a failed sbatch. ssh failing (exit code 255) and
+// the refusals of sbatchLaterRe are 503; any other refusal by sbatch, such as an
+// invalid account or partition, is 400 with sbatch's text. Not running sbatch at
+// all stays 504.
+func submitFailure(err error) *createError {
+	var se *SbatchError
+	if !errors.As(err, &se) {
+		return &createError{code: http.StatusGatewayTimeout, err: err}
+	}
+	if se.ExitCode == 255 {
+		return &createError{code: http.StatusServiceUnavailable, err: fmt.Errorf("ssh to the site failed: %s", strings.TrimSpace(se.Stderr))}
+	}
+	if m := sbatchLaterRe.FindString(se.Stderr); m != "" {
+		return &createError{code: http.StatusServiceUnavailable, err: fmt.Errorf("slurm takes no more jobs of this user now (%s): %s", m, strings.TrimSpace(se.Stderr))}
+	}
+	return &createError{code: http.StatusBadRequest, err: se}
 }
 
 // createPod renders the pod's job script and submits it, or buffers the pod when
@@ -84,6 +146,10 @@ func (h *SidecarHandler) createPod(spanCtx context.Context, data commonIL.Retrie
 	span := trace.SpanFromContext(spanCtx)
 	fail := func(code int, err error) (CreateStruct, *createError) {
 		return CreateStruct{}, &createError{code: code, err: err}
+	}
+
+	if err := checkQueueFlags(data.Pod.Annotations); err != nil {
+		return fail(http.StatusBadRequest, err)
 	}
 
 	containers := data.Pod.Spec.InitContainers
@@ -345,7 +411,7 @@ func (h *SidecarHandler) createPod(spanCtx context.Context, data commonIL.Retrie
 		if err != nil {
 			span.AddEvent("Failed to submit the gang SLURM Job")
 			os.RemoveAll(filesPath)
-			return fail(http.StatusGatewayTimeout, err)
+			return CreateStruct{}, submitFailure(err)
 		}
 
 		// Respond 200 either way (contract-legal):
@@ -368,7 +434,7 @@ func (h *SidecarHandler) createPod(spanCtx context.Context, data commonIL.Retrie
 		if workDir != filesPath {
 			os.RemoveAll(workDir)
 		}
-		return fail(http.StatusGatewayTimeout, err)
+		return CreateStruct{}, submitFailure(err)
 	}
 	log.G(h.Ctx).Info(out)
 	jid, err := handleJidAndPodUid(h.Ctx, data.Pod, h.JIDs, out, filesPath, workDir)

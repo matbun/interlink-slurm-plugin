@@ -8,7 +8,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -46,6 +48,9 @@ func TestSlurmStateRegex(t *testing.T) {
 		// Newly handled states
 		{"timeout", "0:15              TO", "TO", true},
 		{"oom", "0:9               OOM", "OOM", true},
+		// CA and CF must not be read as F or left unmatched
+		{"cancelled", "0:15              CA", "CA", true},
+		{"configuring", "0                 CF", "CF", true},
 		// Completely unknown state should not match
 		{"unknown state XY", "0                 XY", "", false},
 	}
@@ -480,6 +485,135 @@ func TestStatusClosesTimeFiles(t *testing.T) {
 				if target, err := os.Readlink(filepath.Join("/proc/self/fd", fd.Name())); err == nil && strings.HasPrefix(target, workDir+"/") {
 					t.Errorf("state %s left %s open (fd %s)", state, target, fd.Name())
 				}
+			}
+		})
+	}
+}
+
+// /status reports each squeue state so that a caller needs no squeue of its own:
+// queued jobs wait with squeue's reason, a cancelled job ends with reason Cancelled
+// whatever its exit code, and CF is not read as F.
+func TestStatusPerSqueueState(t *testing.T) {
+	const (
+		namespace = "default"
+		podUID    = "uid-state"
+		jid       = "4242"
+	)
+	tests := []struct {
+		line       string // squeue's exit code, state and reason
+		statusFile string // run-main.status, when the container wrote it
+		want       v1.ContainerState
+	}{
+		{line: "0:0                 PD                  Priority", want: v1.ContainerState{Waiting: &v1.ContainerStateWaiting{
+			Reason: "Priority", Message: "SLURM job 4242 is pending (Priority)"}}},
+		{line: "0:0                 PD                  ReqNodeNotAvail, UnavailableNodes:n[1-2]", want: v1.ContainerState{Waiting: &v1.ContainerStateWaiting{
+			Reason: "ReqNodeNotAvail, UnavailableNodes:n[1-2]", Message: "SLURM job 4242 is pending (ReqNodeNotAvail, UnavailableNodes:n[1-2])"}}},
+		{line: "0:0                 PD                  None", want: v1.ContainerState{Waiting: &v1.ContainerStateWaiting{
+			Reason: ReasonSlurmJobPending, Message: "SLURM job 4242 is pending"}}},
+		{line: "0:0                 CF                  None", want: v1.ContainerState{Waiting: &v1.ContainerStateWaiting{
+			Reason: ReasonSlurmJobConfiguring, Message: "SLURM job 4242 is configuring its nodes"}}},
+		{line: "0:15                CA                  None", want: v1.ContainerState{Terminated: &v1.ContainerStateTerminated{
+			ExitCode: 15, Reason: ReasonSlurmJobCancelled, Message: MessageSlurmJobCancelled}}},
+		{line: "0:0                 CA                  None", statusFile: "0", want: v1.ContainerState{Terminated: &v1.ContainerStateTerminated{
+			ExitCode: 0, Reason: ReasonSlurmJobCancelled, Message: MessageSlurmJobCancelled}}},
+		{line: "0:0                 R                   None", want: v1.ContainerState{Running: &v1.ContainerStateRunning{}}},
+		{line: "0:0                 CD                  None", statusFile: "0", want: v1.ContainerState{Terminated: &v1.ContainerStateTerminated{}}},
+		{line: "1:0                 F                   NonZeroExitCode", statusFile: "3", want: v1.ContainerState{Terminated: &v1.ContainerStateTerminated{ExitCode: 3}}},
+		{line: "0:15                TO                  TimeLimit", want: v1.ContainerState{Terminated: &v1.ContainerStateTerminated{
+			ExitCode: 15, Reason: ReasonSlurmJobTimeout, Message: MessageSlurmJobTimeout}}},
+	}
+	for _, tt := range tests {
+		t.Run(strings.Join(strings.Fields(tt.line), " "), func(t *testing.T) {
+			resetStatusCache()
+			t.Cleanup(resetStatusCache)
+			bin := t.TempDir()
+			calls := filepath.Join(bin, "calls")
+			squeue := filepath.Join(bin, "squeue")
+			if err := os.WriteFile(squeue, []byte("#!/bin/sh\necho \"$*\" >> "+calls+"\necho '"+tt.line+"'\n"), 0o700); err != nil { //nolint:gosec // the fake squeue must be executable
+				t.Fatal(err)
+			}
+			dataRoot := t.TempDir() + "/"
+			dir := dataRoot + namespace + "-" + podUID
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if tt.statusFile != "" {
+				if err := os.WriteFile(dir+"/run-main.status", []byte(tt.statusFile+"\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			jids := map[string]*JidStruct{podUID: {JID: jid, PodUID: podUID, PodNamespace: namespace}}
+			h := &SidecarHandler{Config: SlurmConfig{Squeuepath: squeue, DataRootFolder: dataRoot}, JIDs: &jids, Ctx: context.Background()}
+			pod := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: namespace, UID: podUID},
+				Spec:       v1.PodSpec{Containers: []v1.Container{{Name: "main"}}},
+			}
+			body, err := json.Marshal([]*v1.Pod{pod})
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec := httptest.NewRecorder()
+			h.StatusHandler(rec, httptest.NewRequest(http.MethodGet, "/status", bytes.NewReader(body)))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("code = %d, body %q", rec.Code, rec.Body.String())
+			}
+			var resp []commonIL.PodStatus
+			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+				t.Fatal(err)
+			}
+			if len(resp) != 1 || len(resp[0].Containers) != 1 {
+				t.Fatalf("statuses = %+v", resp)
+			}
+			got := resp[0].Containers[0].State
+			if got.Running != nil {
+				got.Running.StartedAt = metav1.Time{}
+			}
+			if got.Terminated != nil {
+				got.Terminated.StartedAt, got.Terminated.FinishedAt = metav1.Time{}, metav1.Time{}
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("state = %+v\nwant    %+v", describeState(got), describeState(tt.want))
+			}
+			ran, err := os.ReadFile(calls)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(ran), "Reason") {
+				t.Fatalf("squeue was not asked for the reason:\n%s", ran)
+			}
+		})
+	}
+}
+
+func describeState(s v1.ContainerState) string {
+	raw, _ := json.Marshal(s)
+	return string(raw)
+}
+
+// The ping answer, /status with no pods, lists pod-group exactly when gangs are
+// enabled, whatever the resource script says.
+func TestPingListsCapabilities(t *testing.T) {
+	for _, gangs := range []bool{true, false} {
+		t.Run("GangSchedulingEnabled="+strconv.FormatBool(gangs), func(t *testing.T) {
+			script := filepath.Join(t.TempDir(), "resources")
+			if err := os.WriteFile(script, []byte(`#!/bin/sh
+echo '{"status":"ok","resources":{"cpu":"8"},"capabilities":["something-else"]}'
+`), 0o700); err != nil { //nolint:gosec // the fake script must be executable
+				t.Fatal(err)
+			}
+			jids := map[string]*JidStruct{}
+			h := &SidecarHandler{Config: SlurmConfig{ResourceScriptPath: script, GangSchedulingEnabled: gangs}, JIDs: &jids, Ctx: context.Background()}
+			rec := httptest.NewRecorder()
+			h.StatusHandler(rec, httptest.NewRequest(http.MethodGet, "/status", strings.NewReader("[]")))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("code = %d, body %q", rec.Code, rec.Body.String())
+			}
+			want := `{"status":"ok","resources":{"cpu":"8"}}`
+			if gangs {
+				want = `{"status":"ok","resources":{"cpu":"8"},"capabilities":["pod-group"]}`
+			}
+			if got := rec.Body.String(); got != want {
+				t.Fatalf("ping = %s, want %s", got, want)
 			}
 		})
 	}

@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -46,10 +45,6 @@ const socketDirNameLen = 12
 // socket path, <root>/<12 hex digits>/fwd-65535.sock, in 107 bytes.
 const maxSocketDirRootLen = 79
 
-// memberUIDPattern matches the UID /submit gives a workload's member: the
-// workload's UID, a dash and the rank.
-var memberUIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}-([0-9]{1,4})$`)
-
 // socketDirRootPattern keeps SocketDirRoot to characters that need no quoting in
 // shell and ssh arguments, and refuses elements that start with a dot.
 var socketDirRootPattern = regexp.MustCompile(`^(/[A-Za-z0-9_][A-Za-z0-9._-]*)+$`)
@@ -67,11 +62,6 @@ func socketDirFor(root, uid string) string {
 		return ""
 	}
 	name := digits[:socketDirNameLen]
-	// The members of one workload share its UID and differ in the rank only.
-	if m := memberUIDPattern.FindStringSubmatch(uid); m != nil {
-		rank, _ := strconv.Atoi(m[1])
-		name = fmt.Sprintf("%s%04d", digits[:socketDirNameLen-4], rank)
-	}
 	if strings.Trim(name, "0123456789abcdefABCDEF") != "" {
 		return ""
 	}
@@ -296,13 +286,9 @@ func NewSlurmConfig() (SlurmConfig, error) {
 			log.G(context.Background()).Infof("Per-pod socket directories under: %s", SlurmConfigInst.SocketDirRoot)
 		}
 
-		if err := validateExecutorConfig(&SlurmConfigInst); err != nil {
+		if err := validateSites(&SlurmConfigInst); err != nil {
 			log.G(context.Background()).Error(err)
 			return SlurmConfig{}, err
-		}
-		if SlurmConfigInst.Executor.Enabled {
-			site, _ := SlurmConfigInst.ExecutorSite()
-			log.G(context.Background()).Infof("Executor for namespace %s, site %s", SlurmConfigInst.Executor.Namespace, site)
 		}
 	}
 	return SlurmConfigInst, nil
