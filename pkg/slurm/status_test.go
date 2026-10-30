@@ -591,7 +591,7 @@ func describeState(s v1.ContainerState) string {
 }
 
 // The ping answer, /status with no pods, lists pod-group exactly when gangs are
-// enabled, whatever the resource script says.
+// enabled and estimate always, whatever the resource script says.
 func TestPingListsCapabilities(t *testing.T) {
 	for _, gangs := range []bool{true, false} {
 		t.Run("GangSchedulingEnabled="+strconv.FormatBool(gangs), func(t *testing.T) {
@@ -608,9 +608,9 @@ echo '{"status":"ok","resources":{"cpu":"8"},"capabilities":["something-else"]}'
 			if rec.Code != http.StatusOK {
 				t.Fatalf("code = %d, body %q", rec.Code, rec.Body.String())
 			}
-			want := `{"status":"ok","resources":{"cpu":"8"}}`
+			want := `{"status":"ok","resources":{"cpu":"8"},"capabilities":["estimate"]}`
 			if gangs {
-				want = `{"status":"ok","resources":{"cpu":"8"},"capabilities":["pod-group","pod-group-create"]}`
+				want = `{"status":"ok","resources":{"cpu":"8"},"capabilities":["pod-group","pod-group-create","estimate"]}`
 			}
 			if got := rec.Body.String(); got != want {
 				t.Fatalf("ping = %s, want %s", got, want)

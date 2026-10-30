@@ -16,20 +16,44 @@ import (
 	exec "github.com/alexellis/go-execute/pkg/v1"
 )
 
+// CapabilityEstimate is listed in the ping answer: the plugin answers /estimate.
+const CapabilityEstimate = "estimate"
+
 // EstimateRequest asks when Slurm would start a job of Nodes nodes with GPUsPerNode
-// GPUs each, submitted now with the default flavor's flags and, when set, the CPUs each
-// node's task needs (sites that tie CPUs to GPUs refuse a GPU job without them) and the
-// job's own time limit (HH:MM:SS), which backfill depends on. Used by a Kueue admission check, so
-// that a multi-node job is admitted only when the site can run it soon.
+// GPUs each, submitted now with the default flavor's flags, then Flags (the job's own
+// sbatch flags as the slurm-job.vk.io/flags annotation writes them, such as the account
+// and QOS of the queue it was admitted to) and, when set, the CPUs each node's task needs
+// (sites that tie CPUs to GPUs refuse a GPU job without them) and the job's own time limit
+// (HH:MM:SS), which backfill depends on. Used by a Kueue admission check, so that a
+// multi-node job is admitted only when the site can run it soon.
 type EstimateRequest struct {
 	Nodes       int    `json:"nodes"`
 	GPUsPerNode int    `json:"gpusPerNode"`
 	CPUsPerNode int    `json:"cpusPerNode,omitempty"`
 	Time        string `json:"time,omitempty"`
+	Flags       string `json:"flags,omitempty"`
 }
 
 // estimateTimeRe is the only time limit form passed on: the flags reach a shell.
 var estimateTimeRe = regexp.MustCompile(`^\d{1,3}:[0-5]\d:[0-5]\d$`)
+
+// estimateFlagWordRe is what each word of Flags may hold: the flags reach a shell, and a
+// second one when SbatchPath forwards them over ssh.
+var estimateFlagWordRe = regexp.MustCompile(`^[A-Za-z0-9_.,:=+/@%-]+$`)
+
+// checkEstimateFlags refuses Flags that a shell would read otherwise, or that start with
+// something sbatch would take as the script.
+func checkEstimateFlags(flags string) error {
+	for _, word := range splitShellWords(flags) {
+		if !estimateFlagWordRe.MatchString(word) {
+			return fmt.Errorf("flags: %q has characters other than %s", word, estimateFlagWordRe)
+		}
+	}
+	if fs := splitSlurmFlags(flags); len(fs) > 0 && !strings.HasPrefix(fs[0], "-") {
+		return fmt.Errorf("flags: %q is not a flag", fs[0])
+	}
+	return nil
+}
 
 // EstimateResponse is Slurm's answer: the expected start time, and its raw output.
 type EstimateResponse struct {
@@ -47,11 +71,12 @@ func estimateFlags(config SlurmConfig, req EstimateRequest) []string {
 	if flavor, ok := config.Flavors[config.DefaultFlavor]; ok {
 		flags = append(flags, flavor.SlurmFlags...)
 	}
+	flags = append(flags, splitSlurmFlags(req.Flags)...)
 	if req.CPUsPerNode > 0 {
 		flags = append(flags, "--cpus-per-task="+strconv.Itoa(req.CPUsPerNode))
 	}
 	if req.Time != "" {
-		// after the flavor's flags: sbatch keeps the last --time
+		// after the flavor's flags and Flags: sbatch keeps the last --time
 		flags = append(flags, "--time="+req.Time)
 	}
 	if req.GPUsPerNode > 0 && !hasGPUFlag(flags) {
@@ -114,8 +139,11 @@ func (h *SidecarHandler) EstimateHandler(w http.ResponseWriter, r *http.Request)
 	if err == nil && req.Time != "" && !estimateTimeRe.MatchString(req.Time) {
 		err = fmt.Errorf("time %q is not HH:MM:SS", req.Time)
 	}
+	if err == nil {
+		err = checkEstimateFlags(req.Flags)
+	}
 	if err != nil || req.Nodes < 1 {
-		http.Error(w, fmt.Sprintf("want {\"nodes\": N >= 1, \"gpusPerNode\": M, \"time\": \"HH:MM:SS\"}: %v", err), http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("want {\"nodes\": N >= 1, \"gpusPerNode\": M, \"time\": \"HH:MM:SS\", \"flags\": \"--qos=...\"}: %v", err), http.StatusBadRequest)
 		return
 	}
 	task := exec.ExecTask{Command: h.Config.Sbatchpath, Args: estimateFlags(h.Config, req), Shell: true}
@@ -137,7 +165,7 @@ func (h *SidecarHandler) EstimateHandler(w http.ResponseWriter, r *http.Request)
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
-	log.G(h.Ctx).Infof("Estimate for %d node(s) x %d GPU(s): start at %s", req.Nodes, req.GPUsPerNode, start)
+	log.G(h.Ctx).Infof("Estimate for %d node(s) x %d GPU(s): start at %s (flags %q)", req.Nodes, req.GPUsPerNode, start, req.Flags)
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(EstimateResponse{Start: start, Raw: strings.TrimSpace(out)}); err != nil {
 		log.G(h.Ctx).Error(err)

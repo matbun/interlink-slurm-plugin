@@ -36,9 +36,31 @@ func TestEstimateFlags(t *testing.T) {
 	if i, j := strings.Index(got, "--time=00:30:00"), strings.Index(got, "--time=01:45:00"); j < 0 || j < i {
 		t.Errorf("the job's time limit must follow the flavor's, got %q", got)
 	}
+	// the queue the job was admitted to comes in Flags, after the flavor and before the job's time
+	got = strings.Join(estimateFlags(config, EstimateRequest{Nodes: 2, GPUsPerNode: 4, Time: "01:45:00", Flags: "--account=proj --qos debug --time=90"}), " ")
+	f, a, q, j := strings.Index(got, "--time=00:30:00"), strings.Index(got, "--account=proj"), strings.Index(got, "--qos debug"), strings.Index(got, "--time=01:45:00")
+	if f < 0 || a < f || q < a || j < q {
+		t.Errorf("Flags: want the flavor's flags, then Flags, then the time limit, got %q", got)
+	}
+	if got := strings.Join(estimateFlags(config, EstimateRequest{Nodes: 1, GPUsPerNode: 4, Flags: "--gres=gpu:2"}), " "); strings.Contains(got, testGres4) {
+		t.Errorf("Flags declaring GPUs: want no GPU flag added, got %q", got)
+	}
 	config.GPUFlag = GPUFlagGPUs
 	if got := strings.Join(estimateFlags(config, EstimateRequest{Nodes: 2, GPUsPerNode: 4}), " "); !strings.Contains(got, "--gpus=8") {
 		t.Errorf("GPUFlag gpus: want the total --gpus=8 in %q", got)
+	}
+}
+
+func TestCheckEstimateFlags(t *testing.T) {
+	for _, ok := range []string{"", "--account=proj --qos=debug --time=30", "-A proj -q debug", "--constraint=highmem --exclusive --gres=gpu:4", `"--qos=debug"`} {
+		if err := checkEstimateFlags(ok); err != nil {
+			t.Errorf("%q: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"--qos=debug;id", "--qos=$(id)", "--comment='a b'", "--qos=`id`", "--qos=a|b", "--qos=a&&id", "job.sh --qos=debug"} {
+		if err := checkEstimateFlags(bad); err == nil {
+			t.Errorf("%q: want refused", bad)
+		}
 	}
 }
 
@@ -110,5 +132,37 @@ func TestEstimateHandler(t *testing.T) {
 	h.EstimateHandler(rec, httptest.NewRequest(http.MethodPost, "/estimate", bytes.NewReader([]byte(`{"nodes":1,"time":"1:00:00; rm -rf ~"}`))))
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("time not HH:MM:SS: code %d, want 400", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	h.EstimateHandler(rec, httptest.NewRequest(http.MethodPost, "/estimate", bytes.NewReader([]byte(`{"nodes":1,"flags":"--qos=debug; rm -rf ~"}`))))
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("flags a shell reads otherwise: code %d, want 400", rec.Code)
+	}
+}
+
+// TestEstimateHandlerPassesFlags runs the handler through the shell that SbatchPath gets:
+// the flavor's flags and Flags reach sbatch as the words they were.
+func TestEstimateHandlerPassesFlags(t *testing.T) {
+	dir := t.TempDir()
+	sbatch := filepath.Join(dir, "sbatch")
+	args := filepath.Join(dir, "args")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + args + "\necho 'sbatch: Job 1 to start at 2026-10-22T20:15:00 using 80 processors'\n"
+	if err := os.WriteFile(sbatch, []byte(script), 0o700); err != nil { //nolint:gosec // a fake executable
+		t.Fatal(err)
+	}
+	h := &SidecarHandler{Config: SlurmConfig{Sbatchpath: sbatch}, Ctx: context.Background()}
+	rec := httptest.NewRecorder()
+	body := `{"nodes":1,"gpusPerNode":4,"time":"00:30:00","flags":"--account=proj --qos debug"}`
+	h.EstimateHandler(rec, httptest.NewRequest(http.MethodPost, "/estimate", bytes.NewReader([]byte(body))))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code %d: %s", rec.Code, rec.Body.String())
+	}
+	got, err := os.ReadFile(args) //nolint:gosec // the test's own file
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "--test-only\n--nodes=1\n--ntasks-per-node=1\n--account=proj\n--qos\ndebug\n--time=00:30:00\n" + testGres4 + "\n--wrap=true\n"
+	if string(got) != want {
+		t.Errorf("sbatch got\n%s\nwant\n%s", got, want)
 	}
 }

@@ -138,3 +138,25 @@ set in a flavor or in the `slurm-job.vk.io/flags` annotation takes precedence.
 A group's job gets the pod's GPUs on every node. `gpus` counts the GPUs of the whole job,
 so there the job asks for the pod's count times the number of nodes, as `POST /estimate`
 does for the same shape.
+
+## Start estimate
+
+`POST /estimate` asks Slurm when a job of a given shape would start if it were submitted
+now, without submitting it (`sbatch --test-only`), so that a caller can hold a multi-node
+job back while the site is busy. The interLink API server forwards its own `/estimate`
+here; the ping answer always lists the capability `estimate`.
+
+```json
+{"nodes": 2, "gpusPerNode": 4, "cpusPerNode": 80, "time": "01:30:00", "flags": "--account=proj --qos=debug"}
+```
+
+The test submission carries the default flavor's flags, then `flags` (the job's own sbatch
+flags as `slurm-job.vk.io/flags` writes them, such as the account and QOS of the queue the
+job was admitted to), one task per node with `cpusPerNode` CPUs when given, the GPUs as
+`GPUFlag` sets unless a flag already asks for them, and the job's time limit (`HH:MM:SS`),
+which backfill depends on, after any other `--time`. The flags reach a shell, so each word
+may hold only letters, digits and `_.,:=+/@%-`; a request with other characters gets 400. The answer is
+`{"start": "<RFC 3339 time>", "raw": "<sbatch output>"}`. Slurm prints local time without a
+zone: set `SiteTimeZone` (an IANA name) when the plugin runs in another zone than the site.
+A malformed request gets 400; when sbatch gives no start time, for instance at a QOS limit
+such as `QOSMaxSubmitJobPerUserLimit`, the answer is 502 with sbatch's output in the body.

@@ -739,9 +739,9 @@ const CapabilityPodGroup = "pod-group"
 // pluginCapabilities lists what the ping answer advertises.
 func pluginCapabilities(config SlurmConfig) []string {
 	if config.GangSchedulingEnabled {
-		return []string{CapabilityPodGroup, CapabilityPodGroupCreate}
+		return []string{CapabilityPodGroup, CapabilityPodGroupCreate, CapabilityEstimate}
 	}
-	return nil
+	return []string{CapabilityEstimate}
 }
 
 // getClusterResourcesFromScript executes the custom script at
