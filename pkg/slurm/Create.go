@@ -364,6 +364,12 @@ func (h *SidecarHandler) renderPod(spanCtx context.Context, data commonIL.Retrie
 		if i < len(data.Pod.Spec.InitContainers) {
 			isInit = true
 		}
+		if !isInit {
+			if err := writeExecScript(h.Config, filesPath, workDir, container.Name, runtime_command); err != nil {
+				os.RemoveAll(filesPath)
+				return fail(http.StatusInternalServerError, err)
+			}
+		}
 
 		span.SetAttributes(
 			attribute.String("job.container"+strconv.Itoa(i)+".name", container.Name),

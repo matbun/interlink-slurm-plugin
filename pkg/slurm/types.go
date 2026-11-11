@@ -135,6 +135,15 @@ type SlurmConfig struct {
 	// (nvidia.com/gpu, amd.com/gpu): "gres" (--gres=gpu:N, the default),
 	// "gpus-per-node" (--gpus-per-node=N) or "gpus" (--gpus=N).
 	GPUFlag string `yaml:"GPUFlag"`
+
+	// ExecPrefix runs a command on a job's compute node, for kubectl exec: the
+	// plugin runs ExecPrefix, then the node's name, then the shell line to run
+	// there, with the exec's stdin, stdout and stderr, and EXEC_TTY=1 in its
+	// environment when a terminal is asked for (an ssh to the node through the
+	// login node, for example). The pod's files directory must be at the same
+	// path on the node. Empty: /exec answers 501.
+	ExecPrefix []string `yaml:"ExecPrefix"`
+
 	// SiteTimeZone is the IANA time zone Slurm prints its times in (e.g.
 	// "Europe/Paris"), used to read `sbatch --test-only` estimates. Empty => the
 	// plugin's own time zone.

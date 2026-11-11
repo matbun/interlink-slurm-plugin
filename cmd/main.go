@@ -210,6 +210,7 @@ func main() {
 	mutex.HandleFunc("/getLogs", SidecarAPIs.GetLogsHandler)
 	mutex.HandleFunc("/system-info", SidecarAPIs.SystemInfoHandler)
 	mutex.HandleFunc("/estimate", SidecarAPIs.EstimateHandler)
+	mutex.HandleFunc("/exec", SidecarAPIs.ExecHandler)
 
 	SidecarAPIs.CreateDirectories()
 	SidecarAPIs.LoadJIDs()
