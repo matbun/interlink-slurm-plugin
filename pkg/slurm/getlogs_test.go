@@ -362,3 +362,26 @@ func TestFollowEveryGangRank(t *testing.T) {
 		})
 	}
 }
+
+// Tail and LimitBytes select what a kubelet does: the last Tail lines, a last
+// line without its newline counted as one, or the first LimitBytes bytes.
+func TestCutLogs(t *testing.T) {
+	for _, tt := range []struct {
+		name, in    string
+		tail, limit int
+		want        string
+	}{
+		{"tail of a log ending in a newline", "a\nb\nc\nd\n", 3, 0, "b\nc\nd\n"},
+		{"tail with a last line unfinished", "a\nb\nc\nd", 2, 0, "c\nd"},
+		{"tail longer than the log", "a\nb\n", 5, 0, "a\nb\n"},
+		{"tail of one", "a\nb\n", 1, 0, "b\n"},
+		{"empty log", "", 3, 0, ""},
+		{"first bytes", "0123456789", 0, 4, "0123"},
+		{"limit longer than the log", "0123", 0, 10, "0123"},
+		{"neither", "a\nb\n", 0, 0, "a\nb\n"},
+	} {
+		if got := cutLogs([]byte(tt.in), tt.tail, tt.limit); got != tt.want {
+			t.Errorf("%s: cutLogs(%q, %d, %d) = %q, want %q", tt.name, tt.in, tt.tail, tt.limit, got, tt.want)
+		}
+	}
+}

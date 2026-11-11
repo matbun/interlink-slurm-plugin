@@ -330,34 +330,7 @@ func (h *SidecarHandler) getLogs(spanCtx context.Context, start int64, req commo
 	output = append(output, jobOutput...)
 	output = append(output, containerOutput...)
 
-	var returnedLogs string
-
-	if req.Opts.Tail != 0 {
-		var lastLines []string
-
-		splittedLines := strings.Split(string(output), "\n")
-
-		if req.Opts.Tail > len(splittedLines) {
-			lastLines = splittedLines
-		} else {
-			lastLines = splittedLines[len(splittedLines)-req.Opts.Tail-1:]
-		}
-
-		for _, line := range lastLines {
-			returnedLogs += line + "\n"
-		}
-	} else if req.Opts.LimitBytes != 0 {
-		var lastBytes []byte
-		if req.Opts.LimitBytes > len(output) {
-			lastBytes = output
-		} else {
-			lastBytes = output[len(output)-req.Opts.LimitBytes-1:]
-		}
-
-		returnedLogs = string(lastBytes)
-	} else {
-		returnedLogs = string(output)
-	}
+	returnedLogs := cutLogs(output, req.Opts.Tail, req.Opts.LimitBytes)
 
 	if req.Opts.Timestamps && (req.Opts.SinceSeconds != 0 || !req.Opts.SinceTime.IsZero()) {
 		temp := returnedLogs
@@ -437,4 +410,24 @@ func (h *SidecarHandler) ReadLogs(logsPath string, span trace.Span, ctx context.
 		}
 	}
 	return output, nil
+}
+
+// cutLogs is the part of output a kubelet would return: with tail, the last tail
+// lines (a last line without its newline counts as one); else with limitBytes,
+// the first limitBytes bytes; else all of it.
+func cutLogs(output []byte, tail, limitBytes int) string {
+	if tail > 0 {
+		lines := strings.SplitAfter(string(output), "\n")
+		if lines[len(lines)-1] == "" {
+			lines = lines[:len(lines)-1]
+		}
+		if tail < len(lines) {
+			lines = lines[len(lines)-tail:]
+		}
+		return strings.Join(lines, "")
+	}
+	if limitBytes > 0 && limitBytes < len(output) {
+		return string(output[:limitBytes])
+	}
+	return string(output)
 }
