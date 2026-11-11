@@ -79,10 +79,16 @@ keeps that knowledge in ONE bash file, `SiteScriptPath` (or `SITESCRIPTPATH`; de
 
 The function is called once, from the batch script on the head's node, with the head
 pod's command as arguments. It starts every rank itself (`srun`, `mpirun`) and its return
-code ends every pod of the gang. Without `interlink.eu/launcher`, each pod runs its own
+code ends every pod of the gang. A group of one pod is a gang of one node, which runs the
+head's `slurm-job.vk.io/pre-exec` in the batch script before the function; a larger gang
+with a launcher runs no pre-exec. Without `interlink.eu/launcher`, each pod runs its own
 command on its own node (rank i on the i-th node of the allocation), with `RANK`,
 `WORLD_SIZE`, `MASTER_ADDR` and `MASTER_PORT` set; the head's
-`slurm-job.vk.io/pre-exec` runs in the head's rank only.
+`slurm-job.vk.io/pre-exec` runs in the head's rank only. By default the head drives the
+gang: the other ranks start once it listens on `MASTER_PORT` (or after two minutes) and are
+stopped when it ends, and its exit code is the gang's. With `interlink.eu/gang-end: all` on
+the head, every rank starts at once and runs its own command to its end; the gang ends with
+the last rank and fails with the first one that failed.
 
 The plugin exports, for the function:
 

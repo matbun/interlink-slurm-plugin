@@ -2,6 +2,7 @@ package slurm
 
 import (
 	"context"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -210,5 +211,68 @@ func TestSiteTopLevelWithoutLauncher(t *testing.T) {
 	}
 	if !strings.Contains(s, `srun --overlap --nodes=1 --ntasks=1 -w "${nodes[1]}"`) {
 		t.Errorf("without a launcher each pod gets its own srun\n---\n%s", s)
+	}
+}
+
+// A group of one pod that names a launcher is a one-node gang: whether it comes in
+// one /createPodGroup call or as a Kueue pod group of one through /create, one sbatch
+// --nodes=1 calls the launcher with the pod's command.
+func TestSiteLauncherGroupOfOne(t *testing.T) {
+	launcher := map[string]string{LauncherAnnotation: "torchrun"}
+	for name, submit := range map[string]func(*testing.T, *SidecarHandler){
+		"createPodGroup": func(t *testing.T, h *SidecarHandler) {
+			req := podGroupRequest(1)
+			req.Pods[0].Pod.Annotations = launcher
+			if jids := createdJIDs(t, postPodGroup(t, h, req)); len(jids) != 1 || jids[0] != "42" {
+				t.Fatalf("job IDs %v, want [42]", jids)
+			}
+		},
+		"create": func(t *testing.T, h *SidecarHandler) {
+			pod := kueueMemberPod(rankUID(0), testGroup, 0, 1)
+			pod.Annotations[LauncherAnnotation] = launcher[LauncherAnnotation]
+			if rec := submitPod(t, h, pod); rec.Code != http.StatusOK {
+				t.Fatalf("code %d, body %q", rec.Code, rec.Body.String())
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h, dataRoot, _, sbatchCount := newPodGroupHandler(t, "echo 'Submitted batch job 42'")
+			h.Config.SiteScriptPath = writeSite(t, testSite)
+			submit(t, h)
+			if n := countLines(t, sbatchCount); n != 1 {
+				t.Fatalf("sbatch ran %d times, want 1", n)
+			}
+			raw, err := os.ReadFile(memberDir(dataRoot, rankUID(0)) + "/job.slurm")
+			if err != nil {
+				t.Fatal(err)
+			}
+			script := string(raw)
+			for _, want := range []string{"#SBATCH --nodes=1\n", "export GANG_NNODES=1\n", "\n( torchrun-launcher "} {
+				if !strings.Contains(script, want) {
+					t.Errorf("job.slurm lacks %q\n---\n%s", want, script)
+				}
+			}
+		})
+	}
+}
+
+// The head's pre-exec runs before the launcher, with the head's socket directory, only
+// when the gang has one node: there the batch shell is the head's rank.
+func TestSiteLauncherPreExecOnOneNode(t *testing.T) {
+	config := SlurmConfig{BashPath: testBashPath, SiteScriptPath: writeSite(t, testSite), SocketDirRoot: socketTestRoot}
+	extra := map[string]string{LauncherAnnotation: "torchrun", preExecAnnotation: "echo set-up-the-tunnel"}
+	dataRoot := t.TempDir() + string(os.PathSeparator)
+	head := mkGangMemberWithRC(t, dataRoot, socketTestUID, extra, []string{testPython}, []string{testTrainScript})
+	entry, ordered := gangOf("g1", head)
+	s := gangScript(t, config, entry, ordered)
+	want := "export INTERLINK_SOCKET_DIR=" + socketDirFor(socketTestRoot, socketTestUID) + "\necho set-up-the-tunnel\n"
+	before, _, found := strings.Cut(s, "torchrun-launcher python train.py ) >>")
+	if !found || !strings.Contains(before, want) || strings.Count(s, "set-up-the-tunnel") != 1 {
+		t.Errorf("a one-node gang runs the head's pre-exec once, before the launcher\n---\n%s", s)
+	}
+
+	s, _ = renderGang(t, config, extra, []string{testPython}, []string{testTrainScript})
+	if strings.Contains(s, "set-up-the-tunnel") {
+		t.Errorf("a gang of two nodes runs no pre-exec with a launcher\n---\n%s", s)
 	}
 }

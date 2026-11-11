@@ -404,7 +404,8 @@ func produceGangSLURMScript(
 		}
 		emitSiteLauncher(ctx, &body, config, ordered, launcherName)
 	} else {
-		emitGangPerRankLaunch(&body, ordered, n, port, config.SocketDirRoot)
+		endAll := strings.TrimSpace(ordered[0].Pod.Annotations[GangEndAnnotation]) == GangEndAll
+		emitGangPerRankLaunch(&body, ordered, n, port, config.SocketDirRoot, endAll)
 	}
 
 	// --- write job.slurm -------------------------------------------------------
@@ -444,8 +445,10 @@ func gangNodeShape(ctx context.Context, ordered []*BufferedMember) (v1.Pod, Reso
 // emitGangPerRankLaunch renders the DEFAULT per-rank launch section (Ray/torch):
 // one `srun --overlap --nodes=1 --ntasks=1` per member, a readiness barrier
 // before the workers, and DRIVER_RC = rank-0's rc as the whole-gang result. Used
-// when the pods name no site launcher.
-func emitGangPerRankLaunch(bodyPtr *strings.Builder, ordered []*BufferedMember, n, port int, socketRoot string) {
+// when the pods name no site launcher. With endAll (GangEndAll) there is no
+// barrier and no driver: every rank runs to its end and the first failure is
+// the gang's result.
+func emitGangPerRankLaunch(bodyPtr *strings.Builder, ordered []*BufferedMember, n, port int, socketRoot string, endAll bool) {
 	body := bodyPtr
 	// Track background PIDs so we can wait/teardown.
 	body.WriteString("declare -a RANK_PIDS=()\n\n")
@@ -497,6 +500,21 @@ func emitGangPerRankLaunch(bodyPtr *strings.Builder, ordered []*BufferedMember, 
 		body.WriteString("     -o " + shellescape.Quote(out) + " -e " + shellescape.Quote(errOut) + " --open-mode=truncate \\\n")
 		body.WriteString("  bash -c " + shellescape.Quote(inner) + " &\n")
 		body.WriteString("RANK_PIDS+=($!)\n\n")
+	}
+
+	if endAll {
+		for _, m := range ordered {
+			emitRank(m)
+		}
+		body.WriteString("# Wait for every rank; the first failure is the gang's result.\n")
+		body.WriteString("GANG_RC=0\n")
+		body.WriteString("for pid in \"${RANK_PIDS[@]}\"; do\n")
+		body.WriteString("  wait \"$pid\"; rc=$?\n")
+		body.WriteString("  [ \"$GANG_RC\" -ne 0 ] || GANG_RC=$rc\n")
+		body.WriteString("done\n")
+		body.WriteString("echo \"GANG_RC=$GANG_RC\"\n")
+		body.WriteString("exit \"$GANG_RC\"\n")
+		return
 	}
 
 	// Head first.
@@ -570,6 +588,12 @@ func emitSiteLauncher(ctx context.Context, body *strings.Builder, config SlurmCo
 	}
 	if socketDir := socketDirFor(config.SocketDirRoot, head.PodUID); socketDir != "" {
 		body.WriteString("export INTERLINK_SOCKET_DIR=" + shellescape.Quote(socketDir) + "\n")
+	}
+	// A gang of one node runs the head's pre-exec (the reverse tunnel's set-up) here, in
+	// the batch shell on that node, as its job.sh would: what it exports reaches the
+	// launcher's steps. On more nodes it would reach ranks whose nodes have no tunnel end.
+	if pre := head.Pod.Annotations[preExecAnnotation]; len(ordered) == 1 && strings.TrimSpace(pre) != "" {
+		body.WriteString(pre + "\n")
 	}
 
 	logDir := head.WorkDir + "/ranks"
