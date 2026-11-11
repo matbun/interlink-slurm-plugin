@@ -347,9 +347,11 @@ func produceGangSLURMScript(
 	// clobber the per-rank --env-file that carries MASTER_ADDR/RANK/WORLD_SIZE, so
 	// torch can inject NCCL_* / UCX_* env here without breaking rendezvous). The
 	// exports also stay visible to the host launcher (UCX/PMIx server side) for the
-	// MPI path. Empty/malformed pairs (no '=', empty key) are skipped.
-	if exports := gangMPIEnvExports(head.Pod.ObjectMeta); len(exports) > 0 {
-		body.WriteString("# --- HPC tuning env (slurm-job.vk.io/mpi-env -> SINGULARITYENV_*; merged into every rank) ---\n")
+	// MPI path. Empty/malformed pairs (no '=', empty key) are skipped. enroot has
+	// no such prefix: the env file of each enroot container passes every
+	// enrootGangEnvPrefix<K> it finds on the host as K instead.
+	if exports := gangMPIEnvExports(head.Pod.ObjectMeta, config.ContainerRuntime); len(exports) > 0 {
+		body.WriteString("# --- HPC tuning env (slurm-job.vk.io/mpi-env -> " + gangMPIEnvPrefix(config.ContainerRuntime) + "*; merged into every rank) ---\n")
 		for _, e := range exports {
 			body.WriteString(e + "\n")
 		}
@@ -400,7 +402,7 @@ func produceGangSLURMScript(
 				_ = os.Remove(fmt.Sprintf("%s/probe-metadata-%s.txt", m.WorkDir, rc.containerName))
 			}
 		}
-		emitSiteLauncher(&body, ordered, launcherName, config.SocketDirRoot)
+		emitSiteLauncher(ctx, &body, config, ordered, launcherName)
 	} else {
 		emitGangPerRankLaunch(&body, ordered, n, port, config.SocketDirRoot)
 	}
@@ -544,7 +546,7 @@ func emitGangPerRankLaunch(bodyPtr *strings.Builder, ordered []*BufferedMember, 
 //
 // Logs: rank i writes to $GANG_LOG_DIR/rank-<i>.out (srun --output=...rank-%n.out),
 // which is pod i's log file; whatever the function prints itself goes to rank 0.
-func emitSiteLauncher(body *strings.Builder, ordered []*BufferedMember, name, socketRoot string) {
+func emitSiteLauncher(ctx context.Context, body *strings.Builder, config SlurmConfig, ordered []*BufferedMember, name string) {
 	head := ordered[0]
 	prefix, appArgs, _, ok := launcherWorkload(head.RuntimeCommands)
 	if !ok {
@@ -566,7 +568,7 @@ func emitSiteLauncher(body *strings.Builder, ordered []*BufferedMember, name, so
 		body.WriteString(`srun --overlap -N1 -n1 -w "${nodes[` + strconv.Itoa(m.Rank) + `]}" hostname -f > ` +
 			shellescape.Quote(m.WorkDir+"/compute-node") + " || true\n")
 	}
-	if socketDir := socketDirFor(socketRoot, head.PodUID); socketDir != "" {
+	if socketDir := socketDirFor(config.SocketDirRoot, head.PodUID); socketDir != "" {
 		body.WriteString("export INTERLINK_SOCKET_DIR=" + shellescape.Quote(socketDir) + "\n")
 	}
 
@@ -585,7 +587,11 @@ func emitSiteLauncher(body *strings.Builder, ordered []*BufferedMember, name, so
 
 	// A subshell: a launcher may end in exec, which must not replace the batch shell
 	// before the status files below are written.
-	body.WriteString("( " + name + launcherFuncSuffix + " " + shellescapeArgs(appArgs) + " ) >>" +
+	setup := ""
+	if config.ContainerRuntime == "enroot" {
+		setup = gangEnrootImage(ctx, config, head)
+	}
+	body.WriteString("( " + setup + name + launcherFuncSuffix + " " + shellescapeArgs(appArgs) + " ) >>" +
 		shellescape.Quote(logDir+"/rank-0.out") + " 2>&1\n")
 	body.WriteString("LAUNCHER_RC=$?\n")
 	body.WriteString("echo \"gang launcher '" + name + "' exited rc=$LAUNCHER_RC\"\n")
@@ -595,6 +601,24 @@ func emitSiteLauncher(body *strings.Builder, ordered []*BufferedMember, name, so
 		}
 	}
 	body.WriteString("exit \"$LAUNCHER_RC\"\n")
+}
+
+// gangEnrootImage is what runs before an enroot launcher, each command ending in " && ": the
+// image of the head's workload container imported once, into the head's directory, as
+// GANG_IMAGE. A launcher path never runs the members' job.sh, which is where a single pod
+// imports its image, so the container GANG_CONTAINER names exists on no node: a launcher
+// starts GANG_IMAGE itself. A failure is the launcher's exit code.
+func gangEnrootImage(ctx context.Context, config SlurmConfig, head *BufferedMember) string {
+	for _, rc := range head.RuntimeCommands {
+		if rc.isInitContainer {
+			continue
+		}
+		sqsh := shellescape.Quote(head.FilesPath + "/" + rc.containerName + head.PodUID + ".sqsh")
+		image := prepareImage(ctx, config, head.Pod.ObjectMeta, rc.containerImage)
+		return config.EnrootPath + " import --output " + sqsh + " " + shellescape.Quote(image) + " && " +
+			"export GANG_IMAGE=" + sqsh + " && "
+	}
+	return ""
 }
 
 // emitGangSocketDirs creates every member's private socket directory (as a single
@@ -615,7 +639,8 @@ func emitGangSocketDirs(body *strings.Builder, root string, ordered []*BufferedM
 }
 
 // gangMPIEnvExports parses the head pod's slurm-job.vk.io/mpi-env annotation
-// ("K=V;K=V") into a slice of `export SINGULARITYENV_<K>=<shellescaped V>` lines.
+// ("K=V;K=V") into a slice of `export SINGULARITYENV_<K>=<shellescaped V>` lines,
+// or `export INTERLINK_ENROOT_ENV_<K>=...` (enrootGangEnvPrefix) for enroot.
 // Empty or malformed pairs (no '=', empty key) are skipped. Returns nil when the
 // annotation is absent or yields no valid pairs.
 // isShellEnvName reports whether s is a valid POSIX shell/env variable name:
@@ -638,7 +663,7 @@ func isShellEnvName(s string) bool {
 	return true
 }
 
-func gangMPIEnvExports(metadata metav1.ObjectMeta) []string {
+func gangMPIEnvExports(metadata metav1.ObjectMeta, runtime string) []string {
 	raw := strings.TrimSpace(metadata.Annotations["slurm-job.vk.io/mpi-env"])
 	if raw == "" {
 		return nil
@@ -661,9 +686,18 @@ func gangMPIEnvExports(metadata metav1.ObjectMeta) []string {
 		if !isShellEnvName(k) {
 			continue
 		}
-		out = append(out, "export SINGULARITYENV_"+k+"="+shellescape.Quote(v))
+		out = append(out, "export "+gangMPIEnvPrefix(runtime)+k+"="+shellescape.Quote(v))
 	}
 	return out
+}
+
+// gangMPIEnvPrefix is the prefix under which the runtime passes a host variable into
+// every rank's container.
+func gangMPIEnvPrefix(runtime string) string {
+	if runtime == "enroot" {
+		return enrootGangEnvPrefix
+	}
+	return "SINGULARITYENV_"
 }
 
 // slurmJobGone classifies one squeue probe of a submitted gang's JID and

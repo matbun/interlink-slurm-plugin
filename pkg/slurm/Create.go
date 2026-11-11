@@ -21,6 +21,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	trace "go.opentelemetry.io/otel/trace"
+	v1 "k8s.io/api/core/v1"
 )
 
 // SubmitHandler generates and submits a SLURM batch script according to provided data.
@@ -258,6 +259,10 @@ func (h *SidecarHandler) renderPod(spanCtx context.Context, data commonIL.Retrie
 	workDir := getJobWorkDir(h.Config, metadata.Annotations, data.Pod.Namespace, string(data.Pod.UID))
 	socketDir := socketDirFor(h.Config.SocketDirRoot, string(data.Pod.UID))
 
+	if err := checkEnrootOptions(h.Config, metadata); err != nil {
+		return fail(http.StatusBadRequest, err)
+	}
+
 	if err := os.MkdirAll(filesPath, 0o755); err != nil {
 		return fail(http.StatusInternalServerError, err)
 	}
@@ -412,6 +417,18 @@ func (h *SidecarHandler) renderPod(spanCtx context.Context, data commonIL.Retrie
 		})
 	}
 
+	// When no app container sets a limit, the flavor default sizes the job like one: an init
+	// container's limit alone would size the workload, and still marked default, the sbatch
+	// flags would fall back to --cpus-per-task=1 and --mem=1.
+	if flavor != nil && flavor.CPUDefault > 0 && !anyLimit(data.Pod.Spec.Containers, v1.ResourceCPU) {
+		resourceLimits.CPU = max(resourceLimits.CPU, flavor.CPUDefault)
+		isDefaultCPU = false
+	}
+	if flavor != nil && flavor.MemoryDefault > 0 && !anyLimit(data.Pod.Spec.Containers, v1.ResourceMemory) {
+		resourceLimits.Memory = max(resourceLimits.Memory, flavor.MemoryDefault)
+		isDefaultRam = false
+	}
+
 	span.SetAttributes(
 		attribute.Int64("job.limits.cpu", resourceLimits.CPU),
 		attribute.Int64("job.limits.memory", resourceLimits.Memory),
@@ -501,4 +518,14 @@ func (h *SidecarHandler) renderPod(spanCtx context.Context, data commonIL.Retrie
 		isDefaultRAM:    isDefaultRam,
 		flavor:          flavor,
 	}, nil
+}
+
+// anyLimit reports whether one of containers sets a limit on resource.
+func anyLimit(containers []v1.Container, resource v1.ResourceName) bool {
+	for _, c := range containers {
+		if q, ok := c.Resources.Limits[resource]; ok && !q.IsZero() {
+			return true
+		}
+	}
+	return false
 }
