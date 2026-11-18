@@ -3,7 +3,6 @@ package slurm
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"math"
 	"net/http"
@@ -182,12 +181,8 @@ func (h *SidecarHandler) renderPod(spanCtx context.Context, data commonIL.Retrie
 		cpuLimitFromContainer := int64(math.Ceil(cpuLimitFloat))
 
 		if cpuLimitFromContainer == 0 {
-			// No CPU limit specified in container, check if we should use flavor default
-			if isDefaultCPU && flavor != nil && flavor.CPUDefault > 0 {
-				log.G(h.Ctx).Infof("Max CPU resource not set for %s. Using flavor '%s' default: %d CPU", container.Name, flavor.FlavorName, flavor.CPUDefault)
-				cpuLimit = flavor.CPUDefault
-			} else if isDefaultCPU {
-				log.G(h.Ctx).Warning(errors.New("Max CPU resource not set for " + container.Name + ". Only 1 CPU will be used"))
+			// No CPU limit specified in container; a flavor default is applied after the loop
+			if isDefaultCPU {
 				cpuLimit = 1
 			}
 		} else {
@@ -200,12 +195,8 @@ func (h *SidecarHandler) renderPod(spanCtx context.Context, data commonIL.Retrie
 		}
 
 		if memoryLimitFromContainer == 0 {
-			// No memory limit specified in container, check if we should use flavor default
-			if isDefaultRam && flavor != nil && flavor.MemoryDefault > 0 {
-				log.G(h.Ctx).Infof("Max Memory resource not set for %s. Using flavor '%s' default: %d bytes", container.Name, flavor.FlavorName, flavor.MemoryDefault)
-				memoryLimit = flavor.MemoryDefault
-			} else if isDefaultRam {
-				log.G(h.Ctx).Warning(errors.New("Max Memory resource not set for " + container.Name + ". Only 1MB will be used"))
+			// No memory limit specified in container; a flavor default is applied after the loop
+			if isDefaultRam {
 				memoryLimit = 1024 * 1024
 			}
 		} else {
@@ -303,6 +294,27 @@ func (h *SidecarHandler) renderPod(spanCtx context.Context, data commonIL.Retrie
 		})
 	}
 
+	// A flavor's CPUDefault and MemoryDefault size the job when no container sets a limit and
+	// the slurm-job.vk.io/flags annotation does not set --cpus-per-task or --mem.
+	if isDefaultCPU && !annotationSetsFlag(metadata.Annotations, "--cpus-per-task") {
+		if flavor != nil && flavor.CPUDefault > 0 {
+			log.G(h.Ctx).Infof("No container sets a CPU limit. Using flavor '%s' default: %d CPU", flavor.FlavorName, flavor.CPUDefault)
+			resourceLimits.CPU = flavor.CPUDefault
+			isDefaultCPU = false
+		} else {
+			log.G(h.Ctx).Warning("No container sets a CPU limit. Only 1 CPU will be used")
+		}
+	}
+	if isDefaultRam && !annotationSetsFlag(metadata.Annotations, "--mem") {
+		if flavor != nil && flavor.MemoryDefault > 0 {
+			log.G(h.Ctx).Infof("No container sets a memory limit. Using flavor '%s' default: %d bytes", flavor.FlavorName, flavor.MemoryDefault)
+			resourceLimits.Memory = flavor.MemoryDefault
+			isDefaultRam = false
+		} else {
+			log.G(h.Ctx).Warning("No container sets a memory limit. Only 1MB will be used")
+		}
+	}
+
 	span.SetAttributes(
 		attribute.Int64("job.limits.cpu", resourceLimits.CPU),
 		attribute.Int64("job.limits.memory", resourceLimits.Memory),
@@ -390,4 +402,14 @@ func (h *SidecarHandler) renderPod(spanCtx context.Context, data commonIL.Retrie
 		isDefaultRAM:    isDefaultRam,
 		flavor:          flavor,
 	}, nil
+}
+
+// annotationSetsFlag reports whether the slurm-job.vk.io/flags annotation sets flag.
+func annotationSetsFlag(annotations map[string]string, flag string) bool {
+	for _, f := range splitSlurmFlags(annotations["slurm-job.vk.io/flags"]) {
+		if slurmFlagKey(f) == flag {
+			return true
+		}
+	}
+	return false
 }
