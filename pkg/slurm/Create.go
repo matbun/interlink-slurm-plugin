@@ -342,6 +342,7 @@ func (h *SidecarHandler) renderPod(spanCtx context.Context, data commonIL.Retrie
 			//os.RemoveAll(filesPath)
 			return fail(http.StatusInternalServerError, err)
 		}
+		defer pathFile.Close()
 
 		mode := os.FileMode(0770)
 
