@@ -17,6 +17,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	trace "go.opentelemetry.io/otel/trace"
+	v1 "k8s.io/api/core/v1"
 )
 
 // SubmitHandler generates and submits a SLURM batch script according to provided data.
@@ -294,23 +295,25 @@ func (h *SidecarHandler) renderPod(spanCtx context.Context, data commonIL.Retrie
 		})
 	}
 
-	// A flavor's CPUDefault and MemoryDefault size the job when no container sets a limit and
-	// the slurm-job.vk.io/flags annotation does not set --cpus-per-task or --mem.
-	if isDefaultCPU && !annotationSetsFlag(metadata.Annotations, "--cpus-per-task") {
+	// A flavor's CPUDefault and MemoryDefault size the job when no app container sets a limit
+	// and the slurm-job.vk.io/flags annotation does not set --cpus-per-task or --mem. An app
+	// container without a limit is not bounded by an init container's limit, so the job gets
+	// the larger of the two.
+	if !anyLimit(data.Pod.Spec.Containers, v1.ResourceCPU) && !annotationSetsFlag(metadata.Annotations, "--cpus-per-task") {
 		if flavor != nil && flavor.CPUDefault > 0 {
-			log.G(h.Ctx).Infof("No container sets a CPU limit. Using flavor '%s' default: %d CPU", flavor.FlavorName, flavor.CPUDefault)
-			resourceLimits.CPU = flavor.CPUDefault
+			log.G(h.Ctx).Infof("No app container sets a CPU limit. Using flavor '%s' default: %d CPU", flavor.FlavorName, flavor.CPUDefault)
+			resourceLimits.CPU = max(resourceLimits.CPU, flavor.CPUDefault)
 			isDefaultCPU = false
-		} else {
+		} else if isDefaultCPU {
 			log.G(h.Ctx).Warning("No container sets a CPU limit. Only 1 CPU will be used")
 		}
 	}
-	if isDefaultRam && !annotationSetsFlag(metadata.Annotations, "--mem") {
+	if !anyLimit(data.Pod.Spec.Containers, v1.ResourceMemory) && !annotationSetsFlag(metadata.Annotations, "--mem") {
 		if flavor != nil && flavor.MemoryDefault > 0 {
-			log.G(h.Ctx).Infof("No container sets a memory limit. Using flavor '%s' default: %d bytes", flavor.FlavorName, flavor.MemoryDefault)
-			resourceLimits.Memory = flavor.MemoryDefault
+			log.G(h.Ctx).Infof("No app container sets a memory limit. Using flavor '%s' default: %d bytes", flavor.FlavorName, flavor.MemoryDefault)
+			resourceLimits.Memory = max(resourceLimits.Memory, flavor.MemoryDefault)
 			isDefaultRam = false
-		} else {
+		} else if isDefaultRam {
 			log.G(h.Ctx).Warning("No container sets a memory limit. Only 1MB will be used")
 		}
 	}
@@ -402,6 +405,16 @@ func (h *SidecarHandler) renderPod(spanCtx context.Context, data commonIL.Retrie
 		isDefaultRAM:    isDefaultRam,
 		flavor:          flavor,
 	}, nil
+}
+
+// anyLimit reports whether one of containers sets a limit on resource.
+func anyLimit(containers []v1.Container, resource v1.ResourceName) bool {
+	for _, c := range containers {
+		if q, ok := c.Resources.Limits[resource]; ok && !q.IsZero() {
+			return true
+		}
+	}
+	return false
 }
 
 // annotationSetsFlag reports whether the slurm-job.vk.io/flags annotation sets flag.
